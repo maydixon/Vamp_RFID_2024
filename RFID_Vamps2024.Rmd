@@ -1,0 +1,182 @@
+---
+title: "RFID antennas - Panama Vampires 2024"
+output: html_notebook
+---
+
+
+#load packages
+```{r}
+library(tidyverse)
+library(readr)
+library(lubridate)
+library(readxl)
+library(chron)
+```
+
+
+# import data
+# goal: pull all files in RFID Data folder into one dataframe 
+```{r}
+ 
+RFID_Data <- read_excel("~/Downloads/RFID-2024-05-15_bayano_tole_chorrera.xlsx")
+
+#remove spaces from DU_DATA column names
+colnames(RFID_Data) <- gsub(" ", "_", colnames(RFID_Data))
+#rename S/N
+RFID_Data<- rename(RFID_Data, S_N = `S/N`)
+
+
+# import bat name data and script
+v2022_bats <- read_excel("/Users/maydixon/GitHub/Vamp_2023/2022_vampire_data.xlsx", sheet = "bats")
+head(v2022_bats)
+
+str(RFID_Data$DEC_Tag_ID)
+```
+
+#script for adding vamp names to dataset
+# goal: add group of origin as well. 
+```{r}
+#table with just the various bat names 
+v2022_names <- v2022_bats %>% select(bat_name, formal_ID, new_formal_ID, RFID_number)
+
+
+# rename to human readable names with year
+
+#       # add "juvenil" to v2022_names
+# v2022_names <- rbind(v2022_names, c("juvenil", "juvenil", "juvenil"))
+
+      # add 22 to names (e.g. bea22)
+v2022_names <- v2022_names %>% mutate(bat_name_full = paste0(bat_name, "22"))
+
+      #make long version of names by the names I want 
+nameslong <- v2022_names %>%
+  gather(ID_type, IDS, c(bat_name, formal_ID, new_formal_ID, RFID_number), na.rm = TRUE) %>%
+  arrange(bat_name_full)
+
+
+      #join by actor to add actor names(match IDS and actor)
+RFID_Data <- RFID_Data %>%
+  left_join(nameslong, by = c("DEC_Tag_ID" = "IDS")) %>%
+  select( - ID_type) 
+
+   
+head(RFID_Data)
+    
+
+
+```
+
+
+# data cleaning
+```{r}
+#keep only last 2 digits of Antenna_ID (delete first 0)
+RFID_Data$Antenna_ID <- str_sub(RFID_Data$Antenna_ID, -2)
+
+
+
+# make  variable with group names (works until different groups share machines, then will have to do it by group_AntennaID)
+RFID_Data <- 
+      RFID_Data %>%
+      mutate( Group =  recode(
+      S_N,
+      "1625" = "C",
+      "1436" ="T",
+      "1624" = "B")
+            )
+
+ #add column with bat names and OG group names
+
+
+
+#c make group_AntennaID dummy variable with antenna number and group
+RFID_Data <- 
+      RFID_Data %>%
+      mutate(Group_AntennaID = paste(Group,  Antenna_ID, sep = "_"))
+    
+#make dates and times dates and times 
+#RFID_Data$Scan_Date <- as.POSIXlt(RFID_Data$Scan_Date, format ="%m/%d/%Y", tz= "America/Panama" )
+
+
+str(RFID_Data$Scan_Time)
+```
+
+
+
+Explore data
+```{r}
+colnames(RFID_Data )
+str(RFID_Data)
+```
+
+
+```{r}
+#Number of reads in each group
+RFID_Data %>%
+      group_by(Group) %>%
+      summarise(n=n())
+
+#Dates in the data
+RFID_Data %>%
+      group_by(RFID_Data$Scan_Date) %>%
+      summarise(n=n())
+
+```
+#when are bats visiting all the feeders?
+```{r}
+RFID_Data %>%
+      filter(Group == "T") %>% #tole is selected
+      filter(Scan_Date == "05/13/2024") %>%
+     # filter(Antenna_ID == c("14", "15", "16")) %>%
+      ggplot(aes(y=Antenna_ID,
+                 x= Scan_Time,
+                 colour = DEC_Tag_ID)) +
+       geom_point( alpha = 0.1) +
+      theme(axis.text.x = element_text(angle = 45)) 
+
+```
+
+#who is feeding at the feeders and when? 
+#select one reader (S_N)
+```{r}
+RFID_Data %>%
+      filter(S_N == "1436") %>% #tole is selected
+      filter(Scan_Date == "05/13/2024") %>%
+      filter(Antenna_ID == c("14", "15", "16")) %>%
+      ggplot(aes(y=Antenna_ID,
+                 x= Scan_Time,
+                 colour = DEC_Tag_ID)) +
+       geom_point( alpha = 0.1) +
+      theme(axis.text.x = element_text(angle = 45)) 
+
+
+RFID_Data %>%
+      filter(S_N == "1436") %>%
+      filter(Scan_Date == "05/13/2024") %>%
+      filter(Antenna_ID == c("14", "15", "16")) %>%
+      ggplot(aes(y=DEC_Tag_ID,
+                 x= Scan_Time,
+                 colour = Antenna_ID)) +
+      geom_point( alpha = 0.1) +
+      theme(axis.text.x = element_text(angle = 45))   #
+
+```
+
+
+# make column for "unique" antenna locations
+# in progress
+```{r}
+unique(RFID_Data$Group_AntennaID)
+# RFID_Data <- 
+#       RFID_Data %>%
+#       mutate( unique_loc =  recode(
+#       Group_AntennaID,
+#       "C_09" = "C_08",
+#       "1436" ="T",
+#       "1624" = "B")
+#             )
+
+
+```
+
+
+
