@@ -9,6 +9,7 @@ output: html_notebook
 library(tidyverse)
 library(readr)
 library(lubridate)
+library(hms)
 library(readxl)
 library(chron)
 ```
@@ -17,47 +18,102 @@ library(chron)
 # import data
 # goal: pull all files in RFID Data folder into one dataframe 
 ```{r}
- 
-RFID_Data <- read_excel("~/Downloads/RFID-2024-05-15_bayano_tole_chorrera.xlsx")
+#main data 
+RFID_Data <- read_excel("RFID-2024-05-15_bayano_tole_chorrera.xlsx")
 
-#remove spaces from DU_DATA column names
+# import bat ID/ name data 
+v2022_bats <- read_excel("/Users/maydixon/GitHub/Vamp_2023/2022_vampire_data.xlsx", sheet = "bats")
+head(v2022_bats)
+```
+
+# RFID data formatting 
+```{r}
+#remove spaces from column names
 colnames(RFID_Data) <- gsub(" ", "_", colnames(RFID_Data))
+
 #rename S/N
 RFID_Data<- rename(RFID_Data, S_N = `S/N`)
 
 
-# import bat name data and script
-v2022_bats <- read_excel("/Users/maydixon/GitHub/Vamp_2023/2022_vampire_data.xlsx", sheet = "bats")
-head(v2022_bats)
+#keep only last 2 digits of Antenna_ID (delete first 0)
+RFID_Data$Antenna_ID <- str_sub(RFID_Data$Antenna_ID, -2)
 
-str(RFID_Data$DEC_Tag_ID)
+
+
+# make  variable with group names of each antenna (works until different groups share machines, then will have to do it by group_AntennaID)
+RFID_Data <- 
+      RFID_Data %>%
+      mutate( Room =  recode(
+      S_N,
+      "1625" = "C",
+      "1436" ="T",
+      "1624" = "B")
+            )
+
+
+#c make room_AntennaID dummy variable with antenna number and group/room
+RFID_Data <- 
+      RFID_Data %>%
+      mutate(Room_AntennaID = paste(Room,  Antenna_ID, sep = "_"))
+    
+#format dates and times 
+
+#Scan date as date
+RFID_Data$Scan_Date<- as.Date(RFID_Data$Scan_Date, format = "%m/%d/%Y", tz= "America/Panama")
+
+#Scan Date_Time as date_time
+RFID_Data  <- RFID_Data %>%
+      mutate(Scan_DateTime = paste(Scan_Date, Scan_Time, sep = " ")) %>%
+      mutate(Scan_DateTime = as.POSIXct(Scan_DateTime, tz= "America/Panama")) %>%
+      relocate(Scan_Date, Scan_Time, Scan_DateTime)
+
+#Read Scan_Time as HMS
+RFID_Data$Scan_Time <- as_hms(RFID_Data$Scan_Time)
+
+
+#make a "night of Date" function, where midnight to 11:59am the next day are given the date of the previous day, to seperate data into nights
+ RFID_Data <- 
+       RFID_Data %>%
+      mutate(Night_of_Date = as.Date(ifelse(Scan_Time > 12, Scan_Date, Scan_Date-1))) %>%
+       relocate(Scan_Date, Night_of_Date)
+
+#make hms(), then make it a factor ordered 12-
+
+
+
+
+set.seed(1)
+slice_sample(RFID_Data, n = 10)
+
+str(RFID_Data)
+
 ```
 
-#script for adding vamp names to dataset
-# goal: add group of origin as well. 
+# script for adding vamp names to dataset
 ```{r}
-#table with just the various bat names 
-v2022_names <- v2022_bats %>% select(bat_name, formal_ID, new_formal_ID, RFID_number)
+#table with just the various bat names (also adding OG group)
+v2022_names <- v2022_bats %>% select(bat_name, formal_ID, new_formal_ID, RFID_number, group_ID )
 
 
-# rename to human readable names with year
+# rename to human readable names with year and groupID
 
-#       # add "juvenil" to v2022_names
-# v2022_names <- rbind(v2022_names, c("juvenil", "juvenil", "juvenil"))
 
-      # add 22 to names (e.g. bea22)
-v2022_names <- v2022_names %>% mutate(bat_name_full = paste0(bat_name, "22"))
+      # add 22 (capture year) and group to names (e.g. bea22)
+v2022_names <- v2022_names %>% mutate(bat_name_full = paste(paste0(bat_name, "22"), group_ID, sep = "_"))
 
-      #make long version of names by the names I want 
+#make long version of names by the names I want 
 nameslong <- v2022_names %>%
   gather(ID_type, IDS, c(bat_name, formal_ID, new_formal_ID, RFID_number), na.rm = TRUE) %>%
-  arrange(bat_name_full)
+  arrange(bat_name_full) %>%
+  select( - ID_type, -group_ID)      #delete extra columns
+      
+nameslong
 
-
-      #join by actor to add actor names(match IDS and actor)
+#join to database by ID, separate name and group of origin
 RFID_Data <- RFID_Data %>%
   left_join(nameslong, by = c("DEC_Tag_ID" = "IDS")) %>%
-  select( - ID_type) 
+      separate_wider_delim(bat_name_full, delim = "_", names = c("Bat_ID", "Bat_Group"))
+ 
 
    
 head(RFID_Data)
@@ -67,65 +123,64 @@ head(RFID_Data)
 ```
 
 
-# data cleaning
+
+# explore data structure
 ```{r}
-#keep only last 2 digits of Antenna_ID (delete first 0)
-RFID_Data$Antenna_ID <- str_sub(RFID_Data$Antenna_ID, -2)
-
-
-
-# make  variable with group names (works until different groups share machines, then will have to do it by group_AntennaID)
-RFID_Data <- 
-      RFID_Data %>%
-      mutate( Group =  recode(
-      S_N,
-      "1625" = "C",
-      "1436" ="T",
-      "1624" = "B")
-            )
-
- #add column with bat names and OG group names
-
-
-
-#c make group_AntennaID dummy variable with antenna number and group
-RFID_Data <- 
-      RFID_Data %>%
-      mutate(Group_AntennaID = paste(Group,  Antenna_ID, sep = "_"))
-    
-#make dates and times dates and times 
-#RFID_Data$Scan_Date <- as.POSIXlt(RFID_Data$Scan_Date, format ="%m/%d/%Y", tz= "America/Panama" )
-
-
-str(RFID_Data$Scan_Time)
-```
-
-
-
-Explore data
-```{r}
-colnames(RFID_Data )
 str(RFID_Data)
 ```
 
-
+# explore data
 ```{r}
 #Number of reads in each group
 RFID_Data %>%
-      group_by(Group) %>%
+      group_by(Room) %>%
       summarise(n=n())
 
 #Dates in the data
 RFID_Data %>%
-      group_by(RFID_Data$Scan_Date) %>%
+      group_by(RFID_Data$Night_of_Date) %>%
       summarise(n=n())
 
 ```
+# make labelling function to plot with midnight in the middle
+# stackoverflow solution from Allan Cameron: https://stackoverflow.com/questions/68578242/plot-arrival-and-departure-times-that-cross-midnight
+```{r}
+# R: split days at noon? 
+
+
+# The hms format stores time as seconds internally.
+# There are 86400 seconds in 24 hours and 43200 seconds in 12 hours, so our
+# labelling function adds 43200 seconds to increase the time values by 12
+# hours, then gives the result modulo 86400 to deal with values above 24 hours.
+# The result is an integer number of seconds, so we need to convert this with as_hms.
+# Finally we take the first 5 characters of the result with substr to give %H:%M
+# formatted character strings as the labels
+
+labelling_fn <- function(x) {
+  (as.numeric(x + 43200) %% 86400) %>%
+     as_hms()                      %>%
+     substr(1, 5)
+}
+
+#Now pass the labelling function to the labels argument of scale_x_time
+# doesn't work at the moment, except for centering axis. But not sure how to shift date-Time. 
+RFID_Data %>%
+      filter(Room == "C") %>%
+      filter(Night_of_Date == "2024-05-13" ) %>%
+      filter(Antenna_ID == c("14", "15", "16")) %>%
+ggplot(aes(y = Bat_ID, x = as_hms((Scan_Time-hours(12))), color = Antenna_ID)) + #as_hms(Scan_Time-hours(12))
+  geom_point() +
+  scale_x_time(labels = labelling_fn) +
+  labs(x = "Feed Time",
+       y = "Bat ID")
+```
+
+
 #when are bats visiting all the feeders?
 ```{r}
 RFID_Data %>%
-      filter(Group == "T") %>% #tole is selected
-      filter(Scan_Date == "05/13/2024") %>%
+      filter(Room == "T") %>% #tole is selected
+      filter(Night_of_Date == "2024-05-13") %>%
      # filter(Antenna_ID == c("14", "15", "16")) %>%
       ggplot(aes(y=Antenna_ID,
                  x= Scan_Time,
@@ -140,7 +195,7 @@ RFID_Data %>%
 ```{r}
 RFID_Data %>%
       filter(S_N == "1436") %>% #tole is selected
-      filter(Scan_Date == "05/13/2024") %>%
+      filter(Scan_Date == "2024-05-13") %>%
       filter(Antenna_ID == c("14", "15", "16")) %>%
       ggplot(aes(y=Antenna_ID,
                  x= Scan_Time,
@@ -150,8 +205,8 @@ RFID_Data %>%
 
 
 RFID_Data %>%
-      filter(S_N == "1436") %>%
-      filter(Scan_Date == "05/13/2024") %>%
+      filter(Room == "T") %>%
+      filter(Scan_Date == "2024-05-15") %>%
       filter(Antenna_ID == c("14", "15", "16")) %>%
       ggplot(aes(y=DEC_Tag_ID,
                  x= Scan_Time,
