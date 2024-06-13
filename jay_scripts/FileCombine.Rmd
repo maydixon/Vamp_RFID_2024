@@ -1,0 +1,91 @@
+---
+title: "FileCombine"
+author: "Jay"
+date: "3/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo = FALSE}
+library(dplyr)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(lubridate)
+library(here)
+library(rprojroot)
+```
+
+This is a function for reading in a file with RFID data and putting it into a usable format for data analysis
+
+```{r readin.RFID-function}
+## ---- readin
+readin.RFID <- function(rfidfile) {
+  datalist <- read_csv(rfidfile)
+  datalist <- datalist %>% 
+    select(1) %>% #if there are extra columns other than the 1st with raw text, remove them
+    rename(rawtext = 1) %>%#rename the first column to rawtext
+    filter(grepl("3D9", rawtext) | grepl("3D6", rawtext)) %>%
+    #filter(!grepl("LOGGING", rawtext),   #filter out any rows with the words LOGGING, NOTE, or LOW so that we're only looking at RFID reads
+    #       !grepl("NOTE", rawtext),
+    #       !grepl("LOW", rawtext)) %>%
+    mutate(RFID = substr(rawtext, 1, 14), #seperate text into seperate columns with RFID num, date, and time
+           id = str_sub(rawtext, 8, 14),
+           stringtime = str_sub(rawtext, 16, 32),
+           time = mdy_hms(stringtime), #make another column in dttm format for the date and time
+           station = str_sub(rfidfile, -8, -5)) #make another column with the feeder name from the file name
+}
+## ---- end-readin
+```
+
+The following is used to combine all the files in the data folder into one large data frame
+
+```{r combine-all-CSV-files, eval = FALSE}
+
+path = here("CSV Data") #folder with all the data files
+
+#create an empty dataframe to compile all the seperate data files into
+out.file <- tibble(
+  rawtext = col_character(),
+  id = col_character(),
+  uniqueRFID = col_character(),
+  stringtime = col_character(),
+  time = col_datetime(),
+  station = col_character()
+)
+
+#creates a vector with all the file names
+file.names <- dir(path) 
+
+#for loop to read each file into the readin.RFID function, then compiles all the seperate dataframes into one
+for(i in 1:length(file.names)){
+  file <- readin.RFID(find_rstudio_root_file("CSV Data", file.names[i]))
+  out.file <- rbind(out.file, file)
+}
+out.file #after running the for loop, this is the dataframe with all the RFID info
+out.file_norepeats <- out.file %>% distinct(.) #Removes 16538 repeated lines
+
+#I've now fixed most of the duplicates that were due to copy errors. There are still about 200 left, but they're probably due to time drift so I have to keep them. So the combination of all the corrected files is allreads_dups_fixed.rds but the drift issue is still there.  
+#write_rds(out.file_norepeats, "allreads_dups_fixed.rds") 
+
+```
+
+The following is used to find duplicate problems in the code.  
+```{r}
+library(janitor)
+
+out.file_ordered <- out.file %>% arrange(station, time)
+out.file_nodupes <- distinct(out.file_ordered) #This takes out all the exact duplicates
+
+#This finds all the instances where an individual is found at multiple locations at the same time
+dupstation <- out.file_nodupes %>% get_dupes(rawtext, RFID, id, stringtime, time) %>% arrange(time)
+
+#write_csv(dupstation, "DuplicateList.csv")
+#write_csv(dupstation, "DuplicateList_fixedchronologyerrors.csv")
+
+```
+
+

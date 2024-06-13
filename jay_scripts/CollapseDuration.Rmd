@@ -1,0 +1,125 @@
+---
+title: "CollapseDurations"
+author: "Jay"
+date: "3/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE}
+library(stringr)
+library(tidyverse)
+library(lubridate)
+library(rprojroot)
+```
+
+This function uses data made from the readin.RFID function and collapses it so that it shows the number of seconds present at a feeder and at what time. It also takes into account when a bird leaves the feeder for a short amount of time and comes back, and will collapse these together. The secaway variable is the amount of time away from the feeder that the function will allow the bird to leave the feeder before it considers it a new feed
+
+```{r duration-function}
+duration.RFID <- function(datafile, secaway){ #This function uses a data made from readin.RFID function and collapses it so that it shows the number of seconds present at a feeder and at what time
+  datafile <- datafile %>% arrange(station, time)
+  collapsed <- tibble() #creates a new tibble to be returned 
+  templine <- tibble(rawtext = "x", RFID = "x", id = "x", stringtime = "1999-01-01 00:00:00", time = "1999-01-01 00:00:00", station = "x") #creates a temporary junk line to the end so that the conditional statements work for the last line of data
+  datafile <- rbind(datafile, templine) #adds the junk line to the end of the data file
+  count <- dseconds(1) #count holds the number of seconds present at the feeder, including any gaps less than or equal to secaway
+  feedsecs <- 1 #feedsecs holds the number of seconds actually feeding, NOT incuding the secaway gaps
+  secs <- as.duration(secaway)
+  for(i in 1:(nrow(datafile)-1)) {
+    if(((datafile$time[i+1] - datafile$time[i]) <= secs) && 
+       (datafile$id[i+1] == datafile$id[i]) &&
+       (datafile$station[i+1] == datafile$station[i])){#checks if the time in line i is only one second lower than the line after i, and if it's the same bird
+      count <- count + as.duration(datafile$time[i+1] - datafile$time[i]) #if the above statement is true, this continues to grow until there is a break in the continuity of the feed
+      feedsecs <- feedsecs + 1
+    }
+    else {#if the seconds are not continuous, this creates a new line to be added to the "collapsed" tibble with all the necessary info
+      templine <- tibble(
+        id = datafile$id[i],
+        starttime = datafile$time[i] - dseconds(count-1),
+        station = datafile$station[i],
+        duration = count,
+        feeding = as.duration(feedsecs)
+      )
+      collapsed <- rbind(collapsed, templine) #combines the newest line of collapsed data to the other lines
+      count <- 1 #returns the duration count to 1 to start over at the top of the for loop
+      feedsecs <- 1 #returns the time feeding to 1 to start over at the top of the for loop
+    }
+  }
+  return(collapsed)
+}
+```
+
+```{r file-by-file-error-check, eval=FALSE}
+#get all the file names in this folder
+file.names <- dir("CSV Data") 
+
+#Goes through all the files in the CSV Data folder and checks for order errors
+#I think this gives an error if it finds nothing wrong...but I'm not sure
+for(i in 1:length(file.names)){
+  file <- readin.RFID(find_rstudio_root_file("CSV Data", file.names[i]))
+  workdur <- duration.RFID(file, 1)
+  print(file.names[i])
+}
+
+```
+
+
+```{r create-duration-dataframes, eval=FALSE}
+
+allreads <- read_rds("allreads_dups_fixed.rds")
+
+#now(tzone = "America/New_York") 
+#fulldur1_full <- duration.RFID(allreads, 1) 
+#now(tzone = "America/New_York") 
+#write_rds(fulldur1_full, "durations1.rds")
+
+#now(tzone = "America/New_York") 
+#fulldur8_full <- duration.RFID(allreads, 8)
+#now(tzone = "America/New_York")
+#write_rds(fulldur8_full, "durations8.rds")
+
+# now(tzone = "America/New_York") 
+# fulldur5_full <- duration.RFID(allreads, 5)
+# now(tzone = "America/New_York")
+# write_rds(fulldur5_full, "durations5.rds")
+# 
+# now(tzone = "America/New_York") 
+# fulldur6_full <- duration.RFID(allreads, 6)
+# now(tzone = "America/New_York")
+# write_rds(fulldur6_full, "durations6.rds")
+# 
+# now(tzone = "America/New_York") 
+# fulldur7_full <- duration.RFID(allreads, 7)
+# now(tzone = "America/New_York")
+# write_rds(fulldur7_full, "durations7.rds")
+# 
+# now(tzone = "America/New_York") 
+# fulldur9_full <- duration.RFID(allreads, 9)
+# now(tzone = "America/New_York")
+# write_rds(fulldur9_full, "durations9.rds")
+
+# now(tzone = "America/New_York")
+# fulldur10_full <- duration.RFID(allreads, 10)
+# now(tzone = "America/New_York")
+# write_rds(fulldur10_full, "durations10.rds")
+# 
+# now(tzone = "America/New_York")
+# fulldur11_full <- duration.RFID(allreads, 11)
+# now(tzone = "America/New_York")
+# write_rds(fulldur11_full, "durations11.rds")
+# 
+# now(tzone = "America/New_York")
+# fulldur12_full <- duration.RFID(allreads, 12)
+# now(tzone = "America/New_York")
+# write_rds(fulldur12_full, "durations12.rds")
+
+
+```
+
+
+
+
+
+

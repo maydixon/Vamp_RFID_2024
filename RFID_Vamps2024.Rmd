@@ -19,8 +19,8 @@ library(chron)
 # goal: pull all files in RFID Data folder into one dataframe 
 ```{r}
 #main data 
-RFID_Data <- read_excel("RFID-2024-05-15_bayano_tole_chorrera.xlsx")
-
+RFID_Data <- read_excel("RFID-2024-06-10_bayano_tole_chorrera.xlsx")
+View(RFID_Data)
 # import bat ID/ name data 
 v2022_bats <- read_excel("/Users/maydixon/GitHub/Vamp_2023/2022_vampire_data.xlsx", sheet = "bats")
 head(v2022_bats)
@@ -54,7 +54,7 @@ RFID_Data <-
 #c make room_AntennaID dummy variable with antenna number and group/room
 RFID_Data <- 
       RFID_Data %>%
-      mutate(Room_AntennaID = paste(Room,  Antenna_ID, sep = "_"))
+      mutate(Room_AntennaID = paste(Room,  Antenna_ID, sep = ""))
     
 #format dates and times 
 
@@ -80,12 +80,113 @@ RFID_Data$Scan_Time <- as_hms(RFID_Data$Scan_Time)
 #make hms(), then make it a factor ordered 12-
 
 
+# add antenna types
+ #add coordinates
+ # add unique locations (combine ones that are the same really)
+RFID_Data <- 
+      RFID_Data %>%
+      mutate( Locations =  recode(
+      Room_AntennaID,
+      "C08" = "C07",
+      "C10" = "C09",
+      "C12" = "C11",
+      "T11" = "T10",
+      "T13" = "T12",
+      "B10" = "B09",
+      "B08" = "B07")
+            ) %>%
+      mutate(Locations = recode(
+           Locations, #change  door names 
+          "B11" = "CBDoor", 
+          "B12" = "BCDoor",
+          "B13" = "BTDoor",
+          "B14" = "TBDoor")) %>%
+          
+      mutate(Antenna_Type = case_match(
+           Room_AntennaID, #add antenna types
+          "C01" ~ "Large", 
+          "C02" ~ "Large",
+          "C03" ~ "Large", 
+          "C04" ~ "Large",
+          "C05" ~ "Large", 
+          "C06" ~ "Large",
+          "C07" ~ "Small", 
+          "C08" ~ "Flat",
+          "C09" ~ "Small", 
+          "C10" ~ "Flat", 
+          "C11" ~ "Small", 
+          "C12" ~ "Flat",
+          "C13" ~ "Small",
+          c("T01", "T02", "T03", "T04", "T05", "T06") ~ "Large", 
+          c("T07", "T08", "T09", "T10", "T12") ~ "Small", 
+          c("T11", "T13") ~ "Flat", 
+          c("B01", "B02", "B03", "B04", "B05", "B06") ~ "Large",
+          c("B07", "B09") ~ "Small", 
+          c("B08", "B10") ~ "Flat", 
+          c("C14", "C15", "C16","T14", "T15", "T16","B14", "B15", "B16") ~ "Feeder", 
+          c("CBDoor","BCDoor","BTDoor", "TBDoor") ~ "Door"
+          )
+      ) %>%
+      mutate(Coords = case_match(
+           Locations, # add coordinates, start with "X,Y", and then split into two columns with "," as seperateor 
+          "C01" ~ "20,200", 
+          "C02" ~ "155,200",
+          "C03" ~ "20,125", 
+          "C04" ~ "150, 125",
+          "C05" ~ "20, 45", 
+          "C06" ~ "150, 38",
+          "C07" ~ "15,8", 
+          "C09" ~ "74,8", 
+          "C11" ~ "160,8", 
+          "C13" ~ "164,160",
+          "C14" ~  "58,146",
+          "C15" ~  "83,146",
+          "C16" ~  "108,146",
+          "CTDoor" ~ "175,93",
+          "TCDoor" ~ "180,93",
+           "T01" ~ "200,200", 
+          "T02" ~ "326,200",
+          "T03" ~ "200,125", 
+          "T04" ~ "326, 125",
+          "T05" ~ "200,45", 
+          "T06" ~ "326,45",
+          "T07" ~ "187,169", 
+          "T08" ~ "189,75",
+          "T09" ~ "195,8", 
+          "T10" ~ "246,8", 
+          "T12" ~ "336,8",
+          "T13" ~ "Small",
+          "T14" ~ "240,146",
+          "T15" ~  "264,146",
+          "T16" ~  "292,146",
+          "TBDoor" ~ "348,93",
+          "BTDoor" ~ "353,93",
+          "B01" ~ "373,200", 
+          "B02" ~ "453,200",
+          "B03" ~ "373, 120", 
+          "B04" ~ "453,100",
+          "B05" ~ "373,40", 
+          "B06" ~ "453,40",
+          "B07" ~ "468,66", 
+          "B09" ~ "458,8", 
+          "B15" ~  "400,146",
+          "B16" ~  "410,146"
+          )) %>%
+      separate_wider_delim( 
+            Coords,
+            delim = ",", 
+            names = c("Coord_X", "Coord_Y")
+                            ) %>%
+      mutate_at(vars(Coord_X, Coord_Y), as.numeric)
+
+
 
 
 set.seed(1)
 slice_sample(RFID_Data, n = 10)
 
-str(RFID_Data)
+
+
 
 ```
 
@@ -120,6 +221,19 @@ head(RFID_Data)
     
 
 
+```
+
+# Explore antenna locations
+```{r}
+RFID_Data %>%
+      ggplot(aes(x= Coord_X, y=Coord_Y, color = HEX_Tag_ID)) +
+      geom_jitter(alpha = 0.5) +
+      scale_y_reverse() + #limits = c(228,0)
+      theme_dark()+
+       theme(legend.position = "none")   +
+      geom_vline(xintercept = 178 ) +
+      geom_vline(xintercept = 178+173+3 ) 
+      
 ```
 
 

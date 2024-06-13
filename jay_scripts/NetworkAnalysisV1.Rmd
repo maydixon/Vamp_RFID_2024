@@ -1,0 +1,336 @@
+---
+title: "NetworkAnalysisV1"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(asnipe)
+library(emmeans)
+```
+
+```{r}
+#you need to download the florisuga package to get access to this
+caps <- read_csv("capswithnames_20210211.csv", col_types =
+                   cols(rfidnum_calculated = col_character()))
+
+rfidplusex <- caps %>% 
+  drop_na(rfid) %>%
+  arrange(name, date_captured) %>% #put all captures in order by name, and the date captured
+  distinct(name, .keep_all = TRUE) %>% #Select ONLY the first color type. Will deal with color changes later
+  inner_join(sexes, by = "name") %>% #join plumage type with genetic sex
+  drop_na(gensex) %>% #drop any individuals that I don't know the sex
+  select(name, species, plutype, gensex, corrugations)
+
+#you need to download the florisuga package to get access to this
+sexes <- read_csv("geneticsexingcompiled_20210211.csv")
+
+#you need to download the florisuga package to get access to this
+nameswide <- read_csv("names_20210211.csv")
+
+nameslong <- nameswide %>%
+  gather(idtype, ids, c(band, rfid, shortrfid, secondrfid, secondshortrfid, secondband), na.rm = TRUE) %>%
+  arrange(name)
+
+allreads <- read_rds("allreads.rds")
+```
+
+First shape the data. Only look at one year at a time because most of these analyses probably aren't meaningful across years. Then create the GMM table.
+```{r}
+ reads2019 <- allreads %>%
+   #Just take the 2019 reads for the period when 20 feeders were up
+   filter(time > "2019-02-19 12:00:00") %>%
+   filter(time < "2019-05-27 12:00:00") %>%
+   #remove extraneous data
+   select(-rawtext, -RFID, -stringtime) %>%
+   #use julian time
+   mutate(jtime = as.numeric(time)) %>%
+   mutate(day = as.Date(time)) %>%
+   mutate(stringday = format(day, "%Y%m%d")) %>%
+   #pull together day and location
+   mutate(locdate = paste(station, stringday, sep="_")) %>%
+   select(-stringday) %>%
+   left_join(nameslong, by = c("id" = "ids")) %>%
+   select(-Mountname, - idtype) %>%
+   left_join(rfidplusex, by = "name") %>%
+   filter(species == "fmel")
+
+ #Only interested in birds that have an RFID
+ sexesrfid <- sexes %>% filter(!is.na(uniquerfid))
+
+ #Only use the specific birds that have their sexes identified
+ reads2019x <- reads2019[reads2019$id %in% sexesrfid$uniquerfid,]
+
+ #GMM data is a GBI with variable time intervals between feeds to create feeding "bouts"
+ gmm_data <- gmmevents(time = reads2019x$jtime,
+                       identity = reads2019x$id,
+                       location = reads2019x$locdate)
+
+#write_rds(gmm_data, "gmm_fmel.rds")
+```
+
+```{r}
+#Reload GBI
+gmm_data <- read_rds("gmm.rds")
+
+#extract the different components, including the gbi
+gbi <- gmm_data$gbi #gbi has every single bout in the rows and the birds in the columns. 1 means the bird was present in the bout 
+events <- gmm_data$metadata # This the information for every bout
+observations_per_event <- gmm_data$B #this is like gbi but it has the total number of times the bird showed up during each bout
+
+#extract just the locations
+locations_data <- data.frame(events) %>%
+  select(Location) %>%
+  mutate(loc = str_sub(Location, 1, 4)) %>%
+  select(loc)
+
+#Get the observed difference in weight degree between sexes. Each bird is in the rows and the columns
+network <- get_network(gbi, data_format= "GBI", association_index = "SRI") 
+
+#Put the network in alphabetical order so that it matches up with the attributes 
+#(which are alphabetical)
+network <- network[order(rownames(network)), order(colnames(network))]
+
+#Setting sample size (number of birds in network) for later
+n <- nrow(network)
+
+###Get a list of all of the birds, in the same order as the network
+birdorder <- data.frame(rownames(network))
+colnames(birdorder)[1] = "Bird"
+birdlistall <- birdorder
+  
+```
+
+```{r}
+#This changes the format to longform so it can be used in join statements
+nameslong <- nameswide %>%
+  gather(idtype, ids, c(band, rfid, shortrfid, secondrfid, secondshortrfid, secondband), na.rm = TRUE) %>%
+  arrange(name)
+
+
+#Goes through all the capture data and finds the individuals with an RFID tag
+rfidcaps <- caps %>% drop_na(rfid) 
+
+rfidplusex <- rfidcaps %>% #
+  arrange(name, date_captured) %>% #put all captures in order by name, and the date captured
+  distinct(name, .keep_all = TRUE) %>% #Select ONLY the first color type. Will deal with color changes later
+  inner_join(sexes, by = "name") %>% #join plumage type with genetic sex
+  drop_na(gensex) %>% #drop any individuals that I don't know the sex
+  select(name, species, plutype, gensex, corrugations)
+
+library(reshape2)
+sightfreq <- data.frame(colSums(gbi)) #finds the number of bouts a bird was present
+sightfreq$Bird <- rownames(sightfreq)
+colnames(sightfreq)[1] = "SightFreq"
+
+library(igraph)
+net <- graph.adjacency(network, mode="undirected", diag=FALSE, weighted=TRUE)
+fg <- fastgreedy.community(net)
+l <- layout.fruchterman.reingold(net)
+deg <- degree(net)
+wdeg <- graph.strength(net)
+
+birdlist = data.frame(birdlistall,deg,wdeg)
+
+#joins the birdlist with name, species, plumage type, sex, and corrugations. The plutype for Guillermo and Dylan needs to be changed since they switched color for 2019 (Dylan is not in this particular data set). For any plumage anlaysis Jazmyn and Katherine need to be removed!!
+birdnameslistall <- birdlist %>%
+  left_join(nameslong, by = c("Bird" = "ids")) %>%
+  select(-Mountname, - idtype) %>%
+  left_join(rfidplusex, by = "name") %>%
+  left_join(sightfreq, by = "Bird") 
+
+```
+
+Need to set a cutoff for the minimum number of observations to be included in the analysis
+```{r}
+cutoff <- 20
+
+birdnameslist_filtered <- birdnameslistall %>% filter(SightFreq > cutoff)
+
+plot(birdnameslist$SightFreq,birdnameslist$deg,pch=19)
+#ideally this should be p>0.05 but here it's not. Joe says not to worry about it. 
+cor.test(birdnameslist$SightFreq,birdnameslist$deg) 
+#Try out doing the same analyses by taking some more individuals (see above where you filtered out everything greater than 20 sightings) out and see if it completely changes the results 
+```
+
+Basic linear model to see if sex influences weighted degree. lm assumes all data is independent, which is why we need a randomization model after this
+```{r}
+birdnameslist <- birdnameslist_filtered %>% 
+  filter(gensex!="") %>% 
+  filter(species=="fmel") %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype == "m", "mlm", if_else(
+      gensex == "f" & plutype == "f", "flf", if_else(
+        gensex == "f" & plutype == "m", "mlf", "mix"))))
+
+sexmod <- lm(log(wdeg) ~ gensex, data = birdnameslist)
+summary(sexmod)
+
+hist(resid(sexmod))
+plot(predict(sexmod), resid(sexmod))
+
+#extract the observed coefficient for comparison to the randomized data (below)
+coef = sexmod$coefficients[2]
+```
+
+```{r}
+#Get names of birds in GBI
+names = colnames(gbi)
+#Make random networks. Don't worry that it says no association matrix provided - it calculates 
+#it from the gbi
+
+perms <- 50000
+
+#This method swaps observations of two birds - so the number of times a bird was seen does not change, only the observations it was seen in change.
+random_networks <- network_permutation(gbi,data_format="GBI", identities = names, 
+                                       permutations= perms, association_index = "SRI"
+                                       ,locations = locations_data$loc, within_location = TRUE)
+
+#write_rds(random_networks, "random_networks.rds")
+
+#Then create dataframe to store coefficients of random networks
+coef.df = data.frame(matrix(NA, nrow = perms, ncol = 1))
+colnames(coef.df) = "coef"
+
+birdnameslistprep <- birdnameslistall %>% select(Bird, name, species, gensex, corrugations)
+
+#calculate coefficients of the random networks
+for (h in c(1:perms)) {
+  randn = random_networks[h,,] #For each random network
+  randnet = graph.adjacency(randn, mode="undirected", diag=FALSE, weighted=TRUE)
+  randdeg = degree(randnet)
+  randwdeg = graph.strength(randnet)
+  #sightfreqrand = data.frame(colSums(gbi))
+  
+  birdlist.rand = data.frame(birdnameslistprep,randdeg,randwdeg)
+  birdlist.rand <- birdlist.rand %>% filter(!is.na(gensex)) %>% filter(species == "fmel")
+  birdlist.randcut <- birdlist.rand %>% filter(Bird %in% birdnameslist$Bird)
+  sexmod.rand = lm(log(randwdeg) ~ gensex, data = birdlist.randcut)
+  coef.df$coef[h] = sexmod.rand$coefficients[2]
+  
+  print(h)
+}
+
+#Then plot histogram of observed compared to random networks
+hist(coef.df$coef, xlab="Coefficients",breaks = 25)
+abline(v=coef, lwd=3,col="red")
+P = 1 - sum(coef > coef.df$coef)/perms
+
+print(P)
+
+head(coef.df)
+tail(coef.df)
+```
+
+
+Let's try doing type instead of sex now
+```{r}
+birdnameslist <- birdnameslist_filtered %>% 
+  filter(gensex!="") %>% 
+  filter(species=="fmel") %>%
+  filter(name != "Katherine") %>% filter(name != "Jazmyn") %>%
+  mutate(plutype2 = if_else(
+    name == "Dylan", "f", if_else(
+      name == "Guillermo", "f", plutype
+  ))) %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype2 == "m", "mlm", if_else(
+      gensex == "f" & plutype2 == "f", "flf", if_else(
+        gensex == "f" & plutype2 == "m", "mlf", "mix"))))
+
+typemod <- lm(sqrt(wdeg) ~ type, data = birdnameslist)
+summary(typemod)
+
+hist(resid(typemod))
+plot(predict(typemod), resid(typemod))
+
+obsdata <- data.frame(emmeans(typemod, pairwise ~ type, type = "response")$contrasts)
+obs1 <- obsdata$estimate[1]
+obs2 <- obsdata$estimate[2]
+obs3 <- obsdata$estimate[3]
+```
+
+```{r}
+#Get names of birds in GBI
+names = colnames(gbi)
+#Make random networks. Don't worry that it says no association matrix provided - it calculates 
+#it from the gbi
+
+perms <- 5000
+
+#This method swaps observations of two birds - so the number of times a bird was seen does not change, only the observations it was seen in change.
+random_networks <- network_permutation(gbi,data_format="GBI", identities = names, 
+                                       permutations= perms, association_index = "SRI"
+                                       ,locations = locations_data$loc, within_location = TRUE)
+
+#Then create dataframe to store coefficients of random networks
+coef.df = data.frame(matrix(NA, nrow = perms, ncol = 3))
+colnames(coef.df) = c("coef1", "coef2", "coef3")
+
+birdnameslistprep <- birdnameslistall %>%
+  mutate(plutype2 = if_else(
+    name == "Dylan", "f", if_else(
+      name == "Guillermo", "f", plutype))) %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype2 == "m", "mlm", if_else(
+      gensex == "f" & plutype2 == "f", "flf", if_else(
+        gensex == "f" & plutype2 == "m", "mlf", "mix")))) %>%
+  select(Bird, name, species, gensex, type, corrugations)
+
+#calculate coefficients of the random networks
+for (h in c(1:perms)) {
+  randn = random_networks[h,,] #For each random network
+  randnet = graph.adjacency(randn, mode="undirected", diag=FALSE, weighted=TRUE)
+  randdeg = degree(randnet)
+  randwdeg = graph.strength(randnet)
+  
+  birdlist.rand = data.frame(birdnameslistprep,randdeg,randwdeg, sightfreqrand)
+  birdlist.rand <- birdlist.rand %>% filter(!is.na(type)) %>% filter(species == "fmel")
+  birdlist.randcut <- birdlist.rand %>% filter(Bird %in% birdnameslist$Bird)
+  
+  typemod.rand <- lm(sqrt(randwdeg) ~ type, data = birdlist.randcut)
+  permdata <- data.frame(emmeans(typemod.rand, pairwise ~ type, type = "response")$contrasts)
+  coef.df$coef1[h] <- permdata$estimate[1]
+  coef.df$coef2[h] <- permdata$estimate[2]
+  coef.df$coef3[h] <- permdata$estimate[3]
+}
+
+#Then plot histogram of observed compared to random networks
+hist(coef.df$coef1, xlab="Coefficients",breaks = 25)
+abline(v=obs1, lwd=3,col="red")
+P = 1 - sum(obs1 > coef.df$coef1)/perms
+print(P)
+
+head(coef.df$coef1)
+tail(coef.df$coef1)
+
+hist(coef.df$coef2, xlab="Coefficients",breaks = 25)
+abline(v=obs2, lwd=3,col="red")
+P = 1 - sum(obs2 > coef.df$coef2)/perms
+print(P)
+
+hist(coef.df$coef3, xlab="Coefficients",breaks = 25)
+abline(v=obs3, lwd=3,col="red")
+P = 1 - sum(obs3 > coef.df$coef3)/perms
+print(P)
+```
+
+
+```{r}
+randn = random_networks[h,,] #For each random network
+net = graph.adjacency(randn, mode="undirected", diag=FALSE, weighted=TRUE)
+deg = degree(net)
+wdeg = graph.strength(net)
+birdlist.rand = data.frame(birdnameslistall,deg,wdeg)
+birdlist.rand = birdlist.rand[!is.na(birdlist.rand$gensex),]
+birdlist.randcut <- birdlist.rand %>% filter(deg > 20)
+sexmod.rand = lm(wdeg~gensex,data=birdlist.randcut)
+coef.df$coef[h] = sexmod.rand$coefficients[2]
+```
+

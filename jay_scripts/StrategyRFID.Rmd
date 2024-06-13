@@ -1,0 +1,3276 @@
+---
+title: "StrategyRFID"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+install.packages("devtools")
+library(devtools)
+install_github("jayjinsing/florisuga", auth_token = "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",force = TRUE)
+library(florisuga)
+library(geosphere)
+library(lme4)
+library(lmerTest)
+library(ggmap)
+library(magick)
+library(broom)
+library(corrplot)
+library(EnvStats)
+```
+
+```{r}
+#All the captures. You need to download the florisuga package to get access to this.
+captures <- read_csv(system.file("extdata", 
+                             "capswithnames_gittrack.csv", package = "florisuga"), col_types =
+                   cols(rfidnum_calculated = col_character()))
+
+#Genetic sex of all individuals. you need to download the florisuga package to get access to this.
+sexes <- read_csv(system.file("extdata", 
+                              "geneticsexingcompiled_gittrack.csv", package = "florisuga"))
+
+
+weightlevels <- read_csv(system.file("extdata",
+                               "weightchain_gittrack.csv", package = "florisuga"))
+
+weightswide <- read_csv(system.file("extdata",
+                               "weightdata_gittrack.csv", package = "florisuga"))
+
+nameswide <- read_csv(system.file("extdata", 
+                              "names_gittrack.csv", package = "florisuga"))
+
+latlong <- read_csv(system.file("extdata", 
+                              "latlong_gittrack.csv", package = "florisuga"))
+```
+
+# Prepare the RFID data
+## Incorperate geographic distances
+Prepare the distance data. 
+
+First make a function that calculates the distances between two points. dailydist() function takes a dataset with a list of stations and calculates the max distance or the total distance between all stations in the dataframe. If given a single birds visits in a day with each line pertaining to a station, it will create a list of all location pairs and the distances between them. This function won't work if there is only one station in the dataset. be sure to specify max or total distance. 
+```{r}
+dailydist <- function(daydata, disttype){
+  crossdata <- crossing(var1 = daydata$station, var2 = daydata$station) %>%
+    filter(var1 != var2) %>%
+    inner_join(latlong, by = c("var1" = "station")) %>%
+    rename(lat1 = lat, long1 = long) %>%
+    inner_join(latlong, by = c("var2" = "station")) %>%
+    rename(lat2 = lat, long2 = long) %>%
+    rowwise() %>%
+    mutate(dist = geosphere::distm(x = c(long1, lat1), y = c(long2, lat2), fun = distGeo)) %>%
+    ungroup() %>% 
+    distinct(dist, .keep_all = TRUE) %>%
+    summarize(maxdist = max(dist), totdist = sum(dist))
+  
+  maxdist = crossdata$maxdist
+  totdist = crossdata$totdist
+  
+  #maxdist is the linear distance between the two most distant feeders visited
+  if(disttype == "max"){
+    return(maxdist)
+  }
+  #totdist is the sum of all the linear distances between all pairwise combinations of feeders visited, even routes not explicitly taken by the bird
+  if(disttype == "total"){
+    return(totdist)
+  }
+}
+
+```
+
+## Basic descriptive stats
+
+```{r}
+stationvisits <- nonmix %>%
+  group_by(station) %>%
+  summarize(stationpopularity = n())
+
+stationvisitors <- nonmix %>%
+  group_by(station, name) %>%
+  summarize(activedays = n()) %>%
+  group_by(station) %>%
+  summarize(stationvisitors = n())
+
+activedays <- nonmix %>%
+  group_by(station, day) %>%
+  summarise(stationdays = n()) %>%
+  group_by(station) %>%
+  summarise(stationdays = n())
+
+stationinfo <- stationvisits %>%
+  inner_join(stationvisitors) %>%
+  inner_join(activedays) %>%
+  mutate(stationpopularity_corrected = stationpopularity/stationdays)
+```
+
+Add in the ranking of each feed by the number of feeds at that station
+```{r}
+#Just need to add in the data on date ends for the schedule before joining
+schedule$dateend <- c("2/02/2018","8/03/2018","2/04/2018","11/05/2018","7/10/2018","17/02/2019","8/04/2019","31/05/2019") 
+
+schedulelong <- schedule %>% 
+  mutate(datestart = dmy(datestart)) %>% mutate(dateend = dmy(dateend)) %>%
+  complete(datestart = seq.Date(min(datestart), max(dateend), by="day")) %>% 
+  fill(numfeederyear, numfeeders) %>% 
+  rename(dayday = datestart) %>%
+  select(-dateend, -period) %>%
+  rename(day = dayday) %>%
+  select(-numfeederyear)
+
+stationdata2 <- nonmix %>%
+  group_by(name, day, station) %>%
+  summarize(feeds = n()) %>%
+  group_by(name, day) %>%
+  mutate(groupid = cur_group_id())
+
+rankedstations <- stationdata2 %>%
+  group_by(day, station) %>%
+  summarize(stationdaytotal = sum(feeds),
+            stationbirdstotal = n_distinct(name)) %>%
+  group_by(day) %>%
+  mutate(daytotalfeeds = sum(stationdaytotal)) %>%
+  arrange(day, station) %>%
+  left_join(schedulelong) %>%
+  arrange(day, stationbirdstotal) %>%
+  mutate(rank_byfeeds = rank(desc(stationdaytotal), ties.method = "min") - 1) %>%
+  mutate(rank_bybirds = rank(desc(stationbirdstotal), ties.method = "min") - 1) %>%
+  mutate(absoluterank_byfeeds = numfeeders - rank_byfeeds,
+         relativerank_byfeeds = absoluterank_byfeeds/numfeeders) %>%
+  mutate(absoluterank_bybirds = numfeeders - rank_bybirds,
+         relativerank_bybirds = absoluterank_bybirds/numfeeders) %>%
+  select(day, station, relativerank_byfeeds, relativerank_bybirds)
+
+ggplot(rankedstations, aes(x = relativerank_byfeeds, y = relativerank_bybirds)) +
+  geom_point() +
+  geom_smooth()
+
+nonmix %>%
+  left_join(rankedstations, by = c("day", "station"))
+```
+
+
+Now make a data frame with each individual, the date, and the max and total distance for that day for that individual.  
+```{r}
+#Create a blank dataframe
+dailystrat <- data.frame(
+  name = character(),
+  day = Date(),
+  totdist = numeric(),
+  maxdist = numeric(),
+  maxsta = character(),
+  nfeeds = numeric(),
+  meandur = numeric(),
+  nstations = numeric(),
+  propmax = numeric(),
+  propmin = numeric(),
+  switches = numeric(),
+  propswitch = numeric(),
+  decentral = numeric(),
+  feederqualfeeds = numeric(),
+  feederqualbirds = numeric()) %>% as_tibble()
+  
+
+#Create a dataframe with just the name, date, and stations visited within one day. groupid is an indexing variable used for the for loop that gives each individual and day a unique ID
+stationdata <- nonmix %>%
+  group_by(name, day, station) %>%
+  summarize(feeds = n()) %>%
+  group_by(name, day) %>%
+  mutate(groupid = cur_group_id()) %>%
+  left_join(rankedstations, by = c("day", "station"))
+# #
+daydata <- nonmix %>%
+  arrange(name, day, starttime) %>%
+  group_by(name, day) %>%
+  mutate(groupid = cur_group_id()) %>%
+  left_join(rankedstations, by = c("day", "station"))
+#
+ #Goes through each groupid number and creates a data from giving the max distance and total distance or each individual on each day
+ for(i in 1:max(stationdata$groupid)){
+   #Isolate the feeder visits during a single day for one individual
+   stationdataset <- stationdata %>% filter(groupid == i)
+   daydataset <- daydata %>%
+     filter(groupid == i) %>%
+     mutate(switch = if_else(station != lag(station), T, F))
+   #Identify the station that had the most feeds
+   maxstation <- max(stationdataset$feeds)
+   #Identify the station that had the least feeds
+   minstation <- min(stationdataset$feeds)
+   if(nrow(stationdataset) == 1){
+     templine <- tibble(
+       name = stationdataset$name[1],
+       day = stationdataset$day[1],
+       totaldist = 10,
+       maxdist = 10,
+       maxsta = maxstation,
+       nfeeds = nrow(daydataset),
+       meandur = mean(daydataset$duration),
+       nstations = nrow(stationdataset),
+       propmax = maxstation/nfeeds,
+       propmin = minstation/nfeeds,
+       switches = sum(daydataset$switch, na.rm = TRUE),
+       propswitch = switches/nfeeds,
+       decentral = 0, 
+       feederqualfeeds = stationdataset$relativerank_byfeeds[1],
+       feederqualbirds = stationdataset$relativerank_bybirds[1]
+     )
+   } else {
+     templine <- tibble(
+       name = stationdataset$name[1],
+       day = stationdataset$day[1],
+       #total distance between every pair of feeders visited (including routes not traveled)
+       totaldist = dailydist(stationdataset, disttype = "total"),
+       #maximum distance between any two feeders visited
+       maxdist = dailydist(stationdataset, disttype = "max"),
+       maxsta = maxstation,
+       nfeeds = nrow(daydataset),
+       meandur = mean(daydataset$duration),
+       nstations = nrow(stationdataset),
+       #Proportion of the total feeds at the most-visited feeder
+       propmax = maxstation/nfeeds,
+       #Proportion of the total feeds at the least-visited feeder
+       propmin = minstation/nfeeds,
+       #Counts the number of times the bird switched feeders
+       switches = sum(daydataset$switch, na.rm = TRUE),
+       #Weights the number of switches by the number of times the bird fed
+       propswitch = switches/nfeeds,
+       #This is a value for how centralized at a single feeder the bird is
+       decentral = (nfeeds-maxstation)/(maxstation),
+       feederqualfeeds = mean(daydataset$relativerank_byfeeds),
+       feederqualbirds = mean(daydataset$relativerank_bybirds)
+     )
+   }
+   dailystrat <- rbind(dailystrat, templine)
+ }
+
+
+#write_rds(dailystrat, "dailystrat.rds")
+dailystrat <- read_rds("dailystrat.rds")
+```
+
+
+
+Now make a data frame with each individual, the date, and the max and total distance for that day for that individual.  
+```{r}
+# #Create a blank dataframe
+# distdata <- data.frame(
+#   name = character(),
+#   day = Date(),
+#   maxdist = numeric(),
+#   totdist = numeric()) %>% as_tibble()
+# 
+# #Create a dataframe with just the name, date, and stations visited within one day. groupid is an indexing variable used for the for loop that gives each individual and day a unique ID
+# stationdata <- all %>% 
+#   distinct(name, day, station) %>%
+#   arrange(name, day, station) %>%
+#   group_by(name, day) %>% 
+#   mutate(groupid = cur_group_id())
+# 
+# #Goes through each groupid number and creates a data from giving the max distance and total distance for each individual on each day
+# for(i in 1:max(stationdata$groupid)){
+#   dataset <- stationdata %>% filter(groupid == i)
+#   if(nrow(dataset) == 1){
+#     templine <- tibble(
+#       name = dataset$name[1], 
+#       day = dataset$day[1], 
+#       maxdist = 10,
+#       totaldist = 10
+#     )
+#   } else {
+#     templine <- tibble(
+#       name = dataset$name[1],
+#       day = dataset$day[1],
+#       maxdist = dailydist(dataset, disttype = "max"), 
+#       totaldist = dailydist(dataset, disttype = "total")
+#     )
+#   }
+#   distdata <- rbind(distdata, templine)
+# }
+# 
+# write_rds(distdata, "distdata.rds")
+distdata <- read_rds("distdata.rds")
+```
+
+
+```{r}
+## Feed frequency and stations
+plotnum <- nonmix %>%
+  group_by(name, day, station) %>%
+  summarize(feeds = n(), meanfeeddur = mean(feeding)) %>%
+  group_by(name, day) %>%
+  summarize(numstation = n(), dayfeeds = sum(feeds), meanfeeddur = meanfeeddur) %>% ungroup %>%
+  mutate(energyintake = dayfeeds*meanfeeddur) %>%
+  inner_join(rfidplusex, by = "name") %>%
+  filter(species == "fmel") %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype == "m", "mlm", if_else(
+      gensex == "f" & plutype == "f", "flf", if_else(
+        gensex == "f" & plutype == "m", "mlf", "mix")))) %>% filter(type != "mix") %>%
+  fixplutype(switch = TRUE) 
+
+#This is the daily activity for all individuals
+daily <- nonmix %>%
+  group_by(name, day, station) %>%
+  summarise(stationenergy = sum(feeding), feeds = n()) %>%
+  group_by(name, day) %>%
+  summarise(numstation = n(), 
+            dayfeeds = sum(feeds), 
+            dayenergy = sum(stationenergy)) %>%
+  mutate(meandailydur = dayenergy/dayfeeds) %>%
+  inner_join(rfidplusex, by = "name") %>%
+  filter(species == "fmel") %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype == "m", "mlm", if_else(
+      gensex == "f" & plutype == "f", "flf", if_else(
+        gensex == "f" & plutype == "m", "mlf", "mix")))) %>% filter(type != "mix") %>%
+  fixplutype(switch = TRUE) %>%
+  left_join(distdata, by = c("name", "day"))
+
+#This is the mean daily behavior for each individual
+individual <- daily %>% 
+  fixplutype(switch = FALSE) %>% filter(!is.na(type)) %>%
+  group_by(name) %>%
+  summarize(type = type, 
+            gensex = gensex, 
+            meandayfeeds = mean(dayfeeds), 
+            meanstation = mean(numstation), 
+            days = n(), 
+            meandur = mean(meandailydur), 
+            meanenergy = mean(dayenergy),
+            meanmaxdist = mean(maxdist),
+            corrugations = corrugations) %>%
+  distinct(name, .keep_all = TRUE) 
+
+table(individual$type)
+
+adindividual <- individual %>% filter(corrugations <= 40)
+table(adindividual$type)
+```
+
+## Spatial predictability
+
+
+```{r}
+#This calculates the amount of change from one day to the next in the number of feeds at each station
+condays <- stationdata %>%
+  ungroup() %>%
+  complete(day, name, station, fill = list(feeds = 0)) %>%
+  #the number of feeds for a station do not show up if a bird did not feed at a station on a particular day, so this pretty much fills in that gap. Now if a bird did not feed at a station on a day, the feeds = 0
+  arrange(name, day, station) %>%
+  group_by(name, day) %>% #need to make some calculations based on the daily activity of each bird, so prepare by grouping
+  mutate(dayfeedtot = sum(feeds),
+         #adds up the total feeds during that day for the individual bird at all stations
+         propfeeds = feeds/dayfeedtot) %>%
+         #this is the proportion of feeds during a day that a bird went to a particular feeder
+  filter(dayfeedtot > 0
+         #Take out any days in which a bird did not feed at all
+         ) %>%
+  ungroup %>%
+  mutate(nextdayfeed = lead(feeds, order_by = station),
+         #adds a column that tells which feeder the bird went to during the next feed
+         nextday = lead(day, order_by = station),
+         #add a column that tells which day the individual fed at next
+         nextname = lead(name, order_by = station),
+         #which individual is next in the data? 
+         nextdayfeedtot = lead(dayfeedtot, order_by = station),
+         #how many times did the bird feed during the next day? 
+         nextdaypropfeeds = lead(propfeeds, order_by = station),
+         #how much did they feed at the same station during the next day?
+         daydiff = abs(nextdaypropfeeds - propfeeds), 
+         #takes the absolute value of the difference between proportions for each feed for each station. Basically if a bird feeds a lot at different stations from day to day this will be high, but it's weighted by the number of total feeds
+         daydiffabs = abs(nextdayfeed - feeds)
+         #rather than proportions, this is the absolute value of the differences between feeds at each station. If a bird feeds at different stations from day to day this will be high, but if they feed a lot, it will be way higher than if they only feed a few times
+         ) %>%
+  filter(nextday == day + days(1),
+         #these calculations only mean anything if the next day is exactly one day after the focal day
+         nextname == name
+         #the next name also has to be the same as the focal individual 
+         )
+
+#Calculate the total amount of difference from one day to the next. A value of 2 is the maximum amount of change from one day to the next
+condaysum <- condays %>%
+  group_by(name, day) %>%
+  summarize(totdiff = sum(daydiff)) %>%
+  #Adds up all the different proportions for each station from one day to the next
+  left_join(sexes) %>%
+  #join with sexes dataset
+  select(name, day, totdiff, gensex)
+
+#For each individual, calculate the mean amount of change from day to day
+condaymean <- condaysum %>%
+  group_by(name) %>%
+  summarize(meancon = mean(totdiff),
+            ndays = n()) %>%
+  left_join(sexes) %>%
+  select(name, meancon, ndays, gensex)
+
+#Are birds that feed more often more predicable?
+ggplot(condaymean, aes(x = ndays, y = meancon)) +
+  facet_grid("gensex") +
+  geom_point() 
+
+#Campare predictability of males and females with meancon
+ggplot(condaymean, mapping = aes(x = gensex, y = meancon)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 1)
+  
+#Compare pedicatibility of males and females with totdiff
+ggplot(condaysum, mapping = aes(x = gensex, y = totdiff)) + 
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 0.1)
+
+#look at the effect of sex on predictability
+lmer(totdiff ~ gensex + (1|name), data = condaysum) %>% summary
+```
+
+Make a function that compares two days and two birds in space use
+```{r}
+spacesimilarity <- function(name1, date1, name2, date2, perday){
+  
+  #Make sure the dates are in the correct format
+  date1 <- ymd(date1)
+  date2 <- ymd(date2)
+  #Extract the feeding times for each bird and date
+  day1times <- timeplay %>% filter(name == name1, day == date1) %>% pull(timeonly)
+  day2times <- timeplay %>% filter(name == name2, day == date2) %>% pull(timeonly)
+  #Get the number of feeds from each day
+  day1feeds <- length(day1times)
+  day2feeds <- length(day2times)
+  
+  #Only calculate the difference if both dates actually have feeds
+  if(day1feeds > 0 && day2feeds > 0){
+      totaldiff <- 0
+      for(i in day1feeds){
+        diff <- day1times[i] - day2times[which(abs(day2times - day1times[i]) == min(abs(day2times - day1times[i])))]
+        totaldiff <- totaldiff + abs(diff)
+      }
+    #Divide the total differences by the number of feeds in the first day
+    perdaycalc <- totaldiff/day1feeds
+    #If perday is TRUE, the function returns perdaycalc, if not it returns the total
+    ifelse(perday, return(perdaycalc), return(totaldiff))
+  }
+  #If either date for the bird has 0 feeds, return an NA
+  else{return(NA)}
+}
+
+timesimilarity(name1 = "Abbey", name2 = "Abbey", date1 = "2019-05-22", date2 = "2019-05-18", perday = TRUE)
+```
+
+
+## Transition predictability
+```{r}
+# How predictable are the transitions from feeder to feeder on a daily basis?
+contrans <- daydata %>%
+  dplyr::select(groupid, name, day, starttime, station) %>%
+  mutate(nextstation = lead(station)) %>%
+  #What's the station the bird visited right after this feed?
+  mutate(trans = str_c(station, nextstation, sep = "-")) %>%
+  #Combine the strings to give each transition an ID name
+  group_by(name, day, trans) %>%
+  summarize(ntrans = n()) %>%
+  #calculate the number of each type of transition
+  group_by(name, day) %>%
+  filter(!is.na(trans)) %>%
+  #remove any data where a transition did not happen
+  ungroup() %>%
+  complete(day, name, trans, fill = list(ntrans = 0)) %>%
+  #Fill in all the 0 data points when a particular transition did not happen
+  group_by(name, day) %>%
+  mutate(daytrans = sum(ntrans),
+         #Number of transitions during the day
+         proptrans = ntrans/daytrans
+         #percent of each transition that happened during the day for each transition type
+         ) %>%
+  filter(daytrans > 0) %>%
+  #Take out any days that never had a transition
+  arrange(name, day, trans) %>%
+  ungroup() %>%
+  mutate(nextdaytrans = lead(ntrans, order_by = trans),
+         #What's the next day in the data set?
+         nextday = lead(day, order_by = trans),
+         #What's the next day in the data set? 
+         nextname = lead(name, order_by = trans),
+         #What's the next individual of the next day in the data set? 
+         nextdaytranstot = lead(daytrans, order_by = trans),
+         #How many transitions of the same type happened the nextday?
+         nextdaytransprop = lead(proptrans, order_by = trans),
+         #What proportion of the next day's transistions were the same type as today?
+         daydiff = abs(nextdaytransprop - proptrans), 
+         #Take the absolute value of the difference in proportion transistions from the next day and today
+         daydiffabs = abs(nextdaytrans - ntrans)
+         #same as above but the difference in total number of transistions from the next day and today
+         ) %>%
+  filter(nextday == day + days(1),
+         nextname == name
+         #filter out any data where the bird is not the same as the next day, or when the days are not consecutive
+         ) %>%
+  mutate(transpresent = if_else(daydiffabs > 0, 1, 0))
+  
+#Add up all the differences for each transition to calculate a difference for every day
+transummary <- contrans %>%
+  group_by(name, day) %>%
+  summarize(totdiff = sum(daydiff)) %>%
+  left_join(sexes) %>%
+  select(name, day, totdiff,gensex) %>%
+  mutate(datestring = as.character(day),
+         namedate = str_c(name, day, sep = " "))
+  
+
+ggplot(transummary, aes(x = gensex, y = totdiff)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 0.1)
+
+#Take the mean for each individual
+contransmean <- transummary %>%
+  group_by(name) %>%
+  summarize(meantrans = mean(totdiff)) %>%
+  left_join(sexes) %>%
+  select(name, meantrans, gensex) 
+
+#Plot each individual
+ggplot(contransmean, aes(x = gensex, y = meantrans)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 1)
+
+lmer(totdiff ~ gensex + (1|name), data = transummary) %>% summary
+```
+
+Repeat the same thing but this time don't include any "transitions" that involve a repeated feeder
+```{r}
+# How predictable are the transitions from feeder to feeder on a daily basis?
+contrans2 <- daydata %>%
+  dplyr::select(groupid, name, day, starttime, station) %>%
+  mutate(nextstation = lead(station)) %>%
+  #What's the station the bird visited right after this feed?
+  filter(station != nextstation) %>%
+  #remove any transitions that are simply to the next feeder
+  mutate(trans = str_c(station, nextstation, sep = "-")) %>%
+  #Combine the strings to give each transition an ID name
+  group_by(name, day, trans) %>%
+  summarize(ntrans = n()) %>%
+  #calculate the number of each type of transition
+  group_by(name, day) %>%
+  filter(!is.na(trans)) %>%
+  #remove any data where a transition did not happen
+  ungroup() %>%
+  complete(day, name, trans, fill = list(ntrans = 0)) %>%
+  #Fill in all the 0 data points when a particular transition did not happen
+  group_by(name, day) %>%
+  mutate(daytrans = sum(ntrans),
+         #Number of transitions during the day
+         proptrans = ntrans/daytrans
+         #percent of each transition that happened during the day for each transition type
+         ) %>%
+  filter(daytrans > 0) %>%
+  #Take out any days that never had a transition
+  arrange(name, day, trans) %>%
+  ungroup() %>%
+  mutate(nextdaytrans = lead(ntrans, order_by = trans),
+         #What's the next day in the data set?
+         nextday = lead(day, order_by = trans),
+         #What's the next day in the data set? 
+         nextname = lead(name, order_by = trans),
+         #What's the next individual of the next day in the data set? 
+         nextdaytranstot = lead(daytrans, order_by = trans),
+         #How many transitions of the same type happened the next day?
+         nextdaytransprop = lead(proptrans, order_by = trans),
+         #What proportion of the next day's transitions were the same type as today?
+         daydiff = abs(nextdaytransprop - proptrans), 
+         #Take the absolute value of the difference in proportion transitions from the next day and today
+         daydiffabs = abs(nextdaytrans - ntrans)
+         #same as above but the difference in total number of transitions from the next day and today
+         ) %>%
+  filter(nextday == day + days(1),
+         nextname == name
+         #filter out any data where the bird is not the same as the next day, or when the days are not consecutive
+         ) %>%
+  mutate(transpresent = if_else(daydiffabs > 0, 1, 0))
+  
+#Add up all the differences for each transition to calculate a difference for every day
+transummary <- contrans2 %>%
+  group_by(name, day) %>%
+  summarize(dailytransistions = mean(daytrans),
+            totdiff = sum(daydiff),
+            abstotdiff = sum(daydiffabs)) %>%
+  mutate(abstotdiffprop = abstotdiff/dailytransistions) %>%
+  left_join(sexes) %>%
+  select(name, day, totdiff,gensex) %>%
+  mutate(datestring = as.character(day),
+         namedate = str_c(name, day, sep = " "))
+  
+
+ggplot(transummary, aes(x = gensex, y = totdiff)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 0.1)
+
+#Take the mean for each individual
+contransmean <- transummary %>%
+  group_by(name) %>%
+  summarize(meantrans = mean(totdiff)) %>%
+  left_join(sexes) %>%
+  select(name, meantrans, gensex) 
+
+#Plot each individual
+ggplot(contransmean, aes(x = gensex, y = meantrans)) +
+  geom_boxplot() +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize = 1)
+```
+
+
+## Time predictability
+
+```{r}
+
+daylibrary <- daydata %>% 
+  ungroup() %>%
+  distinct(name, day) %>%
+  arrange(name, day) %>%
+  mutate(nextday = lead(day),
+         nextbird = lead(name))
+
+timeplay <- daydata %>%
+  ungroup() %>%
+  select(starttime, station, name, plutype, gensex, day) %>%
+  mutate(timeonly = hms::as_hms(starttime))
+
+timepredict <- function(bird, date, time){
+  #This figures out what the next day in the data set is but it may be another bird
+  nextdatelibrary <- daylibrary %>% filter(name == bird, day == date) %>% pull(nextday)
+  nextbirdlibrary <- daylibrary %>% filter(name == bird, day == date) %>% pull(nextbird)
+  #If the next day is the same bird, look at predictability
+  if((date + ddays(1)) == nextdatelibrary && bird == nextbirdlibrary) {
+      #This references the next day in the data set and pulls all the times from the next day. Still might be another bird.
+      nextdaytimes <- timeplay %>% filter(name == bird, day == nextdatelibrary) %>% pull(timeonly)
+      #This finds the time with the minimum distance from the current time on the next day, then calculates the difference
+      timedifference <- time - nextdaytimes[which(abs(nextdaytimes - time) == min(abs(nextdaytimes - time)))]
+      return(as.integer(timedifference))
+    } else {
+      return(NA_integer_)
+    }
+}
+
+time <- format("06:04:34", format = "%H:%M:%S") %>% hms::as_hms()
+
+nextdatelibrary <- daylibrary %>% filter(name == "Abbey", day == "2019-05-08") %>% pull(nextday)
+nextdaytimes <- timeplay %>% filter(name == "Abbey", day == nextdatelibrary) %>% pull(timeonly)
+timedifference <- time - nextdaytimes[which(abs(nextdaytimes - time) == min(abs(nextdaytimes - time)))]
+
+timepredict(bird = "Abbey", date = as_date("2019-05-08"), time = time)
+```
+
+
+What about timing predictability? 
+```{r}
+# timepredictibility <- tibble()
+# for(i in 1:length(timeplay$name)){
+#   templine <- tibble(
+#     name = timeplay$name[i],
+#     day = timeplay$day[i],
+#     starttime = timeplay$starttime[i],
+#     timeonly = timeplay$timeonly[i],
+#     closestdiff = timepredict(bird = timeplay$name[i], date = timeplay$day[i], time = timeplay$timeonly[i])
+#   )
+#   print(i)
+#   timepredictibility <- rbind(timepredictibility, templine)
+# }
+# 
+# timepredictibility %>% tail()
+# 
+# timepredict(bird = timeplay$name[91], date = timeplay$day[91], time = timeplay$timeonly[91])
+# 
+# timepredicatibility
+# 
+# i<-2
+# templine <- tibble(
+#     name = timeplay$name[i],
+#     day = timeplay$day[i],
+#     starttime = timeplay$starttime[i],
+#     timeonly = timeplay$timeonly[i],
+#     closestdiff = timepredict(bird = timeplay$name[i], date = timeplay$day[i], time = timeplay$timeonly[i])
+#   )
+# 
+# timepredictability <- rbind(timepredictability, templine)
+# 
+# write_csv(timepredictibility, "timepredict.csv")
+
+timepredictability <- read_csv("timepredict.csv")
+
+```
+
+```{r}
+tp <- read_csv("timepredict.csv")
+
+timeprep <- tp %>%
+  mutate(absdiff = abs(closestdiff)) %>%
+  group_by(name, day) %>%
+  summarize(totaldiff = sum(absdiff),
+            feeds = n()) %>%
+  mutate(diffperday = totaldiff/feeds) %>%
+  mutate(logdiff = log(diffperday)) %>%
+  filter(!is.na(totaldiff)) %>%
+  left_join(sexes) %>%
+  select(-notes, -extractionyear, -uniquerfid, -rfid, -band, -extractionID)
+
+ggplot(data = timeprep, aes(x = logdiff)) + geom_histogram()
+
+ggplot(data = timeprep, aes(x = feeds, y = logdiff)) + 
+  geom_point() +
+  geom_smooth() + 
+  theme(legend.position = "none") +
+  geom_function(fun = function(x) log(43200/x), aes(col = "red"))
+
+sexes
+
+
+timeprep2 <- timeprep %>%
+  group_by(name) %>%
+  summarize(averagediff = mean(diffperday),
+            days = n(),
+            averagefeeds = mean(feeds),
+            gensex = gensex)
+
+ggplot(data = timeprep2, aes(x = averagefeeds, y = log(averagediff))) +
+  geom_point(aes(col = gensex)) +
+  geom_smooth()
+```
+This function generalizes the time predictability calculation. Rather than looking at the next day, you can input two different dates or birds and it compares the two.  
+```{r}
+timesimilarity <- function(name1, date1, name2, date2, perday){
+  
+  #Make sure the dates are in the correct format
+  date1 <- ymd(date1)
+  date2 <- ymd(date2)
+  #Extract the feeding times for each bird and date
+  day1times <- timeplay %>% filter(name == name1, day == date1) %>% pull(timeonly)
+  day2times <- timeplay %>% filter(name == name2, day == date2) %>% pull(timeonly)
+  #Get the number of feeds from each day
+  day1feeds <- length(day1times)
+  day2feeds <- length(day2times)
+  
+  #Only calculate the difference if both dates actually have feeds
+  if(day1feeds > 0 && day2feeds > 0){
+      totaldiff <- 0
+      for(i in day1feeds){
+        diff <- day1times[i] - day2times[which(abs(day2times - day1times[i]) == min(abs(day2times - day1times[i])))]
+        totaldiff <- totaldiff + abs(diff)
+      }
+    #Divide the total differences by the number of feeds in the first day
+    perdaycalc <- totaldiff/day1feeds
+    #If perday is TRUE, the function returns perdaycalc, if not it returns the total
+    ifelse(perday, return(perdaycalc), return(totaldiff))
+  }
+  #If either date for the bird has 0 feeds, return an NA
+  else{return(NA)}
+}
+
+
+timesimilarity(name1 = "Abbey", name2 = "Abbey", date1 = "2019-05-22", date2 = "2019-05-18", perday = TRUE)
+```
+
+
+
+
+
+
+## Combine all discriptors
+
+```{r}
+dailystrat #Basic calculations
+condaysum #differences in space use
+transummary #differences in transitions
+timeprep #differences in time
+
+daily.prepped <- dailystrat %>%
+  mutate(datestring = as.character(day),
+         namedate = str_c(name, day, sep = " ")) %>%
+  select(-name, -day, -datestring)
+
+condaysum.prepped <- condaysum %>%
+  mutate(datestring = as.character(day),
+         namedate = str_c(name, day, sep = " ")) %>%
+  ungroup() %>%
+  select(-day, -gensex, -datestring, -name) %>%
+  rename(totdiffstation = totdiff)
+
+transummary.prepped <- transummary %>% 
+  ungroup() %>%
+  select(-name, -day, -gensex, -datestring) %>%
+  rename(totdifftrans = totdiff)
+
+timeprep.prepped <- timeprep %>%
+  mutate(datestring = as.character(day),
+         namedate = str_c(name, day, sep = " ")) %>%
+  ungroup() %>%
+  select(-name, -day, -feeds, -datestring) %>%
+  rename(totdifftime = totaldiff,
+         diffperdaytime = diffperday,
+         logdifftime = logdiff)
+  
+
+combined <- timeprep.prepped %>%
+  left_join(daily.prepped) %>%
+  left_join(condaysum.prepped) %>%
+  left_join(transummary.prepped) 
+
+meancombined <- combined %>%
+  mutate(name = sapply(strsplit(namedate, split = " ", fixed = TRUE), function(x) (x[1]))) %>%
+  mutate(date = sapply(strsplit(namedate, split = " ", fixed = TRUE), function(x) (x[2]))) %>%
+  group_by(name) %>%
+  summarize(days = n(),
+            mean_totaldist = mean(totaldist),
+            mean_maxdist = mean(maxdist),
+            mean_maxsta = mean(maxsta),
+            mean_nfeeds = mean(nfeeds),
+            mean_nstations = mean(nstations),
+            mean_propmax = mean(propmax),
+            mean_propmin = mean(propmin),
+            mean_switches = mean(switches),
+            mean_propswitch = mean(propswitch),
+            mean_decentral = mean(decentral),
+            mean_logdifftime = mean(logdifftime),
+            mean_totdiffstation = mean(totdiffstation),
+            mean_totdifftrans = mean(totdifftrans))
+            
+```
+
+```{r}
+combined
+
+ggplot(data = combined, aes(x = -logdifftime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = combined, aes(x = -totdifftrans, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+
+ggplot(data = combined, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm) 
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -totdifftrans)) +
+  geom_point() +
+  geom_smooth(method = lm) 
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) 
+
+
+```
+
+Try to vizualize the strategies
+```{r}
+
+combinepca <- combined %>%
+  select(namedate, 
+         gensex,
+         logdifftime,
+         maxdist,
+         nfeeds,
+         maxsta,
+         nstations,
+         propmax,
+         propmin,
+         switches,
+         propswitch,
+         decentral,
+         totdiffstation,
+         totdifftrans) %>%
+  filter(!is.na(totdifftrans))
+
+fmelstrat.pca <- prcomp(combinepca[,3:14], scale = TRUE)
+
+stratpca <- combinepca %>%
+  select(where(is.numeric)) %>%
+  scale() %>%
+  prcomp()
+
+stratpca %>%
+  augment(combinepca) %>%
+  ggplot(aes(x = .fittedPC1, y = .fittedPC2)) +
+    geom_jitter(width = 0.1, height = 0.1) +
+    theme(legend.position="none") 
+
+arrow_style <- arrow(angle = 20, ends = "first", type = "closed", length = grid::unit(8, "pt"))
+
+stratpca %>%
+  tidy(matrix = "rotation") %>%
+  pivot_wider(names_from = "PC", names_prefix = "PC", values_from = "value") %>%
+  ggplot(aes(PC1, PC2)) +
+  geom_segment(xend = 0, yend = 0, arrow = arrow_style) +
+  geom_text(
+    aes(label = column),
+    hjust = 1, 
+    color = "#904C2F"
+  ) +
+  xlim(-.7, .5) + ylim(-1, .5) +
+  coord_fixed() 
+
+stratpca %>%
+  tidy(matrix = "eigenvalues")
+```
+
+Try to vizualize the mean strategies
+```{r}
+
+combinepca <- meancombined %>%
+  select(name, 
+         mean_logdifftime,
+         mean_maxdist,
+         mean_nfeeds,
+         mean_maxsta,
+         mean_nstations,
+         mean_propmax,
+         mean_propmin,
+         mean_switches,
+         mean_propswitch,
+         mean_decentral,
+         mean_totdiffstation)
+
+fmelstrat.pca <- prcomp(combinepca[,2:12], scale = TRUE)
+
+stratpca <- combinepca %>%
+  select(where(is.numeric)) %>%
+  scale() %>%
+  prcomp()
+
+library(ggalt)
+
+stratpca %>%
+  augment(combinepca) %>%
+  inner_join(sexesprep) %>%
+  ggplot(aes(x = .fittedPC1, y = .fittedPC2)) +
+  geom_point(size = 2, aes(col = gensex)) +
+  scale_color_manual(values=c("darkorchid1", "palegreen3")) +
+  geom_encircle(alpha = 0.2, s_shape = 0.8, aes(fill=gensex)) +
+  theme(legend.position="none") +
+  theme_classic() +
+  scale_fill_manual(values = c("darkorchid1", "palegreen3"))
+  
+
+arrow_style <- arrow(angle = 20, ends = "first", type = "closed", length = grid::unit(8, "pt"))
+
+stratpca %>%
+  tidy(matrix = "rotation") %>%
+  pivot_wider(names_from = "PC", names_prefix = "PC", values_from = "value") %>%
+  ggplot(aes(PC1, PC2)) +
+  geom_segment(xend = 0, yend = 0, arrow = arrow_style) +
+  geom_text(
+    aes(label = column),
+    hjust = 1, 
+    color = "#904C2F"
+  ) +
+  xlim(-.7, .5) + ylim(-1, .5) +
+  coord_fixed() 
+
+stratpca %>%
+  tidy(matrix = "eigenvalues")
+```
+
+Are the numbers correlated? 
+```{r}
+res <- combinepca %>% 
+  select(-name) %>%
+  cor() 
+
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+
+
+Look at low feeding birds
+```{r}
+combined
+
+quantile(combined$nfeeds)
+
+lowfeeds <- combined %>%
+  filter(nfeeds < 6)
+
+ggplot(data = lowfeeds, aes(x = -logdifftime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = lowfeeds, aes(x = -totdifftrans, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = lowfeeds, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth() +
+  facet_grid("gensex")
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -totdifftrans)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = combined, aes(x = log(nfeeds), y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+```
+
+Look at high feeding birds
+```{r}
+combined
+
+quantile(combined$nfeeds)
+
+highfeeds <- combined %>%
+  filter(nfeeds > 70)
+
+ggplot(data = highfeeds, aes(x = -logdifftime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -diffperdaytime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -totdifftrans, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = highfeeds, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = lowfeeds, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = highfeeds, aes(x = log(nfeeds), y = -logdifftime)) +
+  geom_point() +
+  geom_smooth() +
+  facet_grid("gensex")
+
+ggplot(data = highfeeds, aes(x = log(nfeeds), y = -totdifftrans)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+ggplot(data = highfeeds, aes(x = log(nfeeds), y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+
+
+```
+
+
+Look at high station, lower feeding birds -- greater than 5 feeders
+```{r}
+combined
+
+quantile(combined$nstations)
+
+highstations <- combined %>%
+  filter(nstations > 5)
+
+highdata <- rbind(highstations, highfeeds)
+
+ggplot(data = highstations, aes(x = -logdifftime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -logdifftime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+lm(totdiffstation ~ logdifftime, data = highstations) %>% summary()
+lm(totdiffstation ~ logdifftime, data = highfeeds) %>% summary()
+lm(totdiffstation ~ logdifftime*nstations, data = highstations) %>% summary()
+
+
+ggplot(data = highstations, aes(x = -diffperdaytime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -diffperdaytime, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+lm(totdiffstation ~ diffperdaytime, data = highstations) %>% summary()
+lm(totdiffstation ~ diffperdaytime, data = highfeeds) %>% summary()
+
+ggplot(data = highstations, aes(x = -totdifftrans, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -totdifftrans, y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highstations, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highfeeds, aes(x = -totdifftrans, y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+lm(totdifftrans ~ logdifftime, data = highstations) %>% summary()
+lm(totdifftrans ~ logdifftime, data = highfeeds) %>% summary()
+lm(totdifftrans ~ logdifftime*nstations, data = combined) %>% summary()
+
+ggplot(data = highstations, aes(x = log(nfeeds), y = -logdifftime)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+ggplot(data = highstations, aes(x = log(nfeeds), y = -totdifftrans)) +
+  geom_point() +
+  geom_smooth(method = lm) 
+
+ggplot(data = highstations, aes(x = log(nfeeds), y = -totdiffstation)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  facet_grid("gensex")
+```
+
+
+# Overall Behavior Descriptions 
+
+Look at behavior using the number of stations and maximum distance between feeders
+```{r}
+
+#All days and individuals
+ggplot(daily, aes(dayfeeds, numstation)) + 
+  geom_jitter() +
+  geom_smooth() + 
+  geom_smooth(method = "lm") 
+
+#All days and individuals but with maxdist
+ggplot(daily, aes(dayfeeds, log(maxdist))) + 
+  geom_jitter() +
+  geom_smooth() + 
+  geom_smooth(method = "lm") 
+
+#All days and individuals, but seperated by type
+ggplot(daily, aes(dayfeeds, numstation, col = type)) +
+  facet_grid("type") +
+  geom_jitter() +
+  geom_smooth() + 
+  geom_smooth(method = "lm") 
+
+#All days and individuals, but seperated by type, maxdist
+ggplot(daily, aes(dayfeeds, maxdist, col = type)) +
+  facet_grid("type") +
+  geom_jitter() +
+  geom_smooth() + 
+  geom_smooth(method = "lm") 
+
+#This time using the means, all individuals
+ggplot(individual, aes(meandayfeeds, meanstation, col = days)) + 
+  geom_point() +
+  geom_smooth() + 
+  geom_smooth(method = "lm", col = "red") 
+
+#This time using the means, all individuals, maxdist
+ggplot(individual, aes(meandayfeeds, log(meanmaxdist))) + 
+  geom_point() +
+  geom_smooth() + 
+  geom_smooth(method = "lm", col = "red") 
+
+#Means separated using type
+ggplot(individual, aes(meandayfeeds, meanstation, col = type)) + 
+  facet_grid("type") +
+  geom_point() +
+  geom_smooth(col = "black") + 
+  geom_smooth(method = "lm", col = "red") 
+
+#Means separated using type, maxdist
+ggplot(individual, aes(meandayfeeds, meanmaxdist, col = type)) + 
+  facet_grid("type") +
+  geom_point() +
+  geom_smooth(col = "black") + 
+  geom_smooth(method = "lm", col = "red") 
+```
+
+Nice plot of all activity
+```{r}
+alldaily <- ggplot(daily, aes(dayfeeds, numstation)) + 
+  geom_jitter() +
+  geom_smooth() +
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid = element_blank(),
+        panel.border = element_blank()) +
+  scale_x_continuous(limits = c(0, 175), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.5,11), expand = c(0, 0), breaks = c(1,2,3,4,5,6,7,8,9,10)) +
+  xlab("Feeds per day") +
+  ylab("# Feeders per day")
+
+ggsave(alldaily, file = "alldaily.png", height = 3, width = 5)
+```
+
+Nice plot of individual activity
+```{r}
+allind <- ggplot(individual, aes(meandayfeeds, meanstation)) + 
+  geom_point() +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "none",
+        panel.border = element_blank(),
+        axis.line = element_line()) +
+  scale_x_continuous(limits = c(0, 60), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.9,5), expand = c(0, 0)) +
+  xlab("Mean feeds per day") +
+  ylab("Mean # of feeders per day")
+
+ggsave(allind, file = "allind.png", height = 3, width = 5)
+```
+
+Nice plot of the individual means
+```{r}
+strategyplot <- ggplot(individual, aes(meandayfeeds, meanstation)) + 
+  geom_point(aes(col = type)) +
+  scale_color_manual(values = c("seagreen3", "steelblue2", "gray50")) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, col = "black") +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, col = "black") +
+  theme_bw() +
+  facet_wrap(~type, scales = "free_y", ncol=1, labeller = as_labeller(c(flf = "Heterochrome Females", mlf = "Androchrome Females", mlm = "Androchrome Males"))) +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  xlab("Mean feeder visits per day") +
+  ylab("Mean number of feeders visited per day")
+
+ggsave("strategyplot.pdf", strategyplot, width = 3, height = 6, dpi = 600)
+```
+
+Nice plot of the individual means but no juveniles
+```{r}
+strategyplot <- ggplot(adindividual, aes(meandayfeeds, meanstation)) + 
+  geom_point(aes(col = type)) +
+  scale_color_manual(values = c("seagreen3", "steelblue2", "gray50")) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, col = "black") +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, col = "black") +
+  theme_bw() +
+  facet_wrap(~type, scales = "free_y", ncol=1, labeller = as_labeller(c(flf = "Heterochrome Female", mlf = "Androchrome Female", mlm = "Androchrome Male"))) +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  xlab("Mean feeder visits per day") +
+  ylab("Mean number of feeders visited per day")
+
+ggsave("strategyplot.png", strategyplot, width = 3, height = 6)
+```
+
+Nice plot of the individual means but JUST juveniles
+```{r}
+
+juvindividual <- individual %>% filter(corrugations > 40)
+
+strategyplot <- ggplot(juvindividual, aes(meandayfeeds, meanstation)) + 
+  geom_point(aes(col = type)) +
+  scale_color_manual(values = c("seagreen3", "steelblue2", "gray50")) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, col = "black") +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, col = "black") +
+  theme_bw() +
+  facet_wrap(~type, scales = "free_y", ncol=1, labeller = as_labeller(c(flf = "Heterochrome Female", mlf = "Androchrome Female", mlm = "Androchrome Male"))) +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  xlab("Mean feeder visits per day") +
+  ylab("Mean number of feeders visited per day")
+
+ggsave("strategyplot.png", strategyplot, width = 3, height = 6)
+
+
+
+```
+
+Nice plot of the individual means for presentation
+```{r}
+strategyplotpres <- ggplot(individual, aes(meandayfeeds, meanstation)) + 
+  geom_point(aes(col = type)) +
+  scale_color_manual(values = c("seagreen3", "steelblue2", "gray50")) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, col = "black") +
+  theme_bw() +
+  facet_wrap(~type, scales = "free_y", ncol=1, labeller = as_labeller(c(flf = "Heterochrome Female", mlf = "Androchrome Female", mlm = "Androchrome Male"))) +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  xlab("Mean feeds per day") +
+  ylab("Mean # of feeders visited per day")
+
+ggsave("strategyplotpres.png", strategyplotpres, width = 4.5, height = 6)
+```
+
+Nice plot of the individual means (distance)
+```{r}
+strategyplot <- ggplot(individual, aes(meandayfeeds, meanmaxdist)) + 
+  geom_point(aes(col = type)) +
+  scale_color_manual(values = c("seagreen3", "steelblue2", "gray50")) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, col = "black") +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, col = "black") +
+  theme_bw() +
+  facet_wrap(~type, scales = "free_y", ncol=1, labeller = as_labeller(c(flf = "Heterochrome Female", mlf = "Androchrome Female", mlm = "Androchrome Male"))) +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  xlab("Mean feeder visits per day") +
+  ylab("Mean number of feeders visited per day")
+```
+
+
+```{r}
+strat_flf <- individual %>% filter(type == "flf")
+strat_mlf <- individual %>% filter(type == "mlf")
+strat_mlm <- individual %>% filter(type == "mlm")
+
+max(strat_flf$meandayfeeds)
+max(strat_mlf$meandayfeeds)
+max(strat_mlm$meandayfeeds)
+
+
+stratmod <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = individual)
+stratmod.1 <- lm(meanstation ~ meandayfeeds, data = individual)
+stratmod.2 <- lm(meanstation ~ I(meandayfeeds^2), data = individual)
+AIC(stratmod, stratmod.1)
+AIC(stratmod, stratmod.2)
+anova(stratmod, stratmod.1)
+anova(stratmod, stratmod.2)
+summary(stratmod)
+
+stratmod <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = individual)
+stratmod.1 <- lm(meanmaxdist ~ meandayfeeds, data = individual)
+stratmod.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = individual)
+AIC(stratmod, stratmod.1)
+AIC(stratmod, stratmod.2)
+anova(stratmod, stratmod.1)
+anova(stratmod, stratmod.2)
+summary(stratmod.1)
+
+
+stratmod <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = individual)
+stratmod.1 <- lm(meanmaxdist ~ meandayfeeds, data = individual)
+stratmod.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = individual)
+AIC(stratmod, stratmod.1)
+AIC(stratmod, stratmod.2)
+anova(stratmod, stratmod.1)
+anova(stratmod, stratmod.2)
+summary(stratmod)
+
+stratmod_flf <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = strat_flf)
+stratmod_flf.1 <- lm(meanstation ~ meandayfeeds, data = strat_flf)
+stratmod_flf.2 <- lm(meanstation ~ I(meandayfeeds^2), data = strat_flf)
+AIC(stratmod_flf,stratmod_flf.1)
+AIC(stratmod_flf,stratmod_flf.2)
+anova(stratmod_flf,stratmod_flf.1)
+anova(stratmod_flf,stratmod_flf.2)
+summary(stratmod_flf)
+
+stratmod_flf <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = strat_flf)
+stratmod_flf.1 <- lm(meanmaxdist ~ meandayfeeds, data = strat_flf)
+stratmod_flf.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = strat_flf)
+AIC(stratmod_flf,stratmod_flf.1)
+AIC(stratmod_flf,stratmod_flf.2)
+anova(stratmod_flf,stratmod_flf.1)
+anova(stratmod_flf,stratmod_flf.2)
+summary(stratmod_flf)
+
+
+stratmod_mlf <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlf)
+stratmod_mlf.1 <- lm(meanstation ~ meandayfeeds, data = strat_mlf)
+stratmod_mlf.2 <- lm(meanstation ~ I(meandayfeeds^2), data = strat_mlf)
+AIC(stratmod_mlf, stratmod_mlf.1)
+AIC(stratmod_mlf, stratmod_mlf.2)
+anova(stratmod_mlf,stratmod_mlf.1)
+anova(stratmod_mlf,stratmod_mlf.2)
+summary(stratmod_mlf)
+
+stratmod_mlf <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlf)
+stratmod_mlf.1 <- lm(meanmaxdist ~ meandayfeeds, data = strat_mlf)
+stratmod_mlf.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = strat_mlf)
+AIC(stratmod_mlf, stratmod_mlf.1)
+AIC(stratmod_mlf, stratmod_mlf.2)
+anova(stratmod_mlf,stratmod_mlf.1)
+anova(stratmod_mlf,stratmod_mlf.2)
+summary(stratmod_mlf.1)
+
+
+stratmod_mlm <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlm)
+stratmod_mlm.1 <- lm(meanstation ~ meandayfeeds, data = strat_mlm)
+stratmod_mlm.2 <- lm(meanstation ~ I(meandayfeeds^2), data = strat_mlm)
+AIC(stratmod_mlm,stratmod_mlm.1)
+AIC(stratmod_mlm,stratmod_mlm.2)
+anova(stratmod_mlm,stratmod_mlm.1)
+anova(stratmod_mlm,stratmod_mlm.2)
+summary(stratmod_mlm)
+
+stratmod_mlm <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlm)
+stratmod_mlm.1 <- lm(meanmaxdist ~ meandayfeeds, data = strat_mlm)
+stratmod_mlm.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = strat_mlm)
+AIC(stratmod_mlm,stratmod_mlm.1)
+AIC(stratmod_mlm,stratmod_mlm.2)
+anova(stratmod_mlm,stratmod_mlm.1)
+anova(stratmod_mlm,stratmod_mlm.2)
+summary(stratmod_mlm.1)
+
+stratmod_type <- lm(meanstation ~ meandayfeeds*type, data = individual)
+summary(stratmod_type)
+
+
+lm(meanstation ~ meandayfeeds+ I(meandayfeeds^2) + type, data = individual) %>% summary()
+sustratmod.0mmary(stratmod.0)
+
+```
+
+
+```{r}
+strat_mlf <- juvindividual %>% filter(type == "mlf")
+strat_mlm <- juvindividual %>% filter(type == "mlm")
+
+stratmod <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = juvindividual)
+stratmod.1 <- lm(meanstation ~ meandayfeeds, data = juvindividual)
+stratmod.2 <- lm(meanstation ~ I(meandayfeeds^2), data = juvindividual)
+AIC(stratmod, stratmod.1)
+AIC(stratmod, stratmod.2)
+anova(stratmod, stratmod.1)
+anova(stratmod, stratmod.2)
+summary(stratmod)
+
+stratmod_mlf <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlf)
+stratmod_mlf.1 <- lm(meanstation ~ meandayfeeds, data = strat_mlf)
+stratmod_mlf.2 <- lm(meanstation ~ I(meandayfeeds^2), data = strat_mlf)
+AIC(stratmod_mlf, stratmod_mlf.1)
+AIC(stratmod_mlf, stratmod_mlf.2)
+anova(stratmod_mlf,stratmod_mlf.1)
+anova(stratmod_mlf,stratmod_mlf.2)
+summary(stratmod_mlf)
+
+stratmod_mlm <- lm(meanstation ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlm)
+stratmod_mlm.1 <- lm(meanstation ~ meandayfeeds, data = strat_mlm)
+stratmod_mlm.2 <- lm(meanstation ~ I(meandayfeeds^2), data = strat_mlm)
+AIC(stratmod_mlm,stratmod_mlm.1)
+AIC(stratmod_mlm,stratmod_mlm.2)
+anova(stratmod_mlm,stratmod_mlm.1)
+anova(stratmod_mlm,stratmod_mlm.2)
+summary(stratmod_mlm)
+
+stratmod_mlm <- lm(meanmaxdist ~ meandayfeeds + I(meandayfeeds^2), data = strat_mlm)
+stratmod_mlm.1 <- lm(meanmaxdist ~ meandayfeeds, data = strat_mlm)
+stratmod_mlm.2 <- lm(meanmaxdist ~ I(meandayfeeds^2), data = strat_mlm)
+AIC(stratmod_mlm,stratmod_mlm.1)
+AIC(stratmod_mlm,stratmod_mlm.2)
+anova(stratmod_mlm,stratmod_mlm.1)
+anova(stratmod_mlm,stratmod_mlm.2)
+summary(stratmod_mlm.1)
+
+stratmod_type <- lm(meanstation ~ meandayfeeds*type, data = individual)
+summary(stratmod_type)
+```
+
+```{r}
+stratmod_flf <- lm(meanstation ~ meanmaxdist + I(meanmaxdist^2), data = strat_flf)
+stratmod_flf.1 <- lm(meanstation ~ meanmaxdist, data = strat_flf)
+anova(stratmod_flf,stratmod_flf.1)
+summary(stratmod_flf)
+
+stratmod_mlf <- lm(meanstation ~ meanmaxdist + I(meanmaxdist^2), data = strat_mlf)
+stratmod_mlf.1 <- lm(meanstation ~ meanmaxdist, data = strat_mlf)
+anova(stratmod_mlf,stratmod_mlf.1)
+
+stratmod_mlm <- lm(meanstation ~ meanmaxdist + I(meanmaxdist^2), data = strat_mlm)
+stratmod_mlm.1 <- lm(meanstation ~ meanmaxdist, data = strat_mlm)
+anova(stratmod_mlm,stratmod_mlm.1)
+summary(stratmod_mlm)
+```
+
+```{r}
+dstrat_flf <- daily %>% filter(type == "flf")
+dstrat_mlf <- daily %>% filter(type == "mlf")
+dstrat_mlm <- daily %>% filter(type == "mlm")
+
+stratmod_flf <- lmer(numstation ~ dayfeeds + I(dayfeeds^2) + (1|name) + (1|day), data = dstrat_flf)
+stratmod_flf.1 <- lmer(numstation ~ dayfeeds + (1|name) + (1|day), data = dstrat_flf)
+anova(stratmod_flf,stratmod_flf.1)
+summary(stratmod_flf)
+
+stratmod_mlf <- lmer(numstation ~ dayfeeds + I(dayfeeds^2) + (1|name) + (1|day), data = dstrat_mlf)
+stratmod_mlf.1 <- lmer(numstation ~ dayfeeds + (1|name) + (1|day), data = dstrat_mlf)
+anova(stratmod_mlf,stratmod_mlf.1)
+summary(stratmod_mlf)
+
+stratmod_mlm <- lmer(numstation ~ dayfeeds + I(dayfeeds^2) + (1|name) + (1|day), data = dstrat_mlm)
+stratmod_mlm.1 <- lmer(numstation ~ dayfeeds + (1|name) + (1|day), data = dstrat_mlm)
+anova(stratmod_mlm,stratmod_mlm.1)
+summary(stratmod_mlm)
+```
+
+
+```{r}
+ #Total seconds feeding during all days and individuals 
+daily %>% 
+ggplot(aes(dayenergy)) + 
+  geom_histogram(binwidth = 1) +
+  geom_vline(aes(xintercept = quantile(dayenergy, probs = 0.50))) +
+  geom_vline(aes(xintercept = quantile(dayenergy, probs = 0.25))) +
+  geom_vline(aes(xintercept = quantile(dayenergy, probs = 0.75))) +
+  geom_vline(aes(xintercept = mean(dayenergy), color = "red")) 
+
+ #If you want to look at each sex seperately
+vline <- summarise(group_by(daily,gensex), median = median(dayenergy))
+
+daily %>% 
+ggplot(aes(dayenergy)) + 
+  facet_grid("gensex") +
+  geom_histogram(binwidth = 1) +
+  geom_vline(data = vline, aes(xintercept = median))
+
+quantile(daily$dayenergy, probs = .5)
+
+#Total seconds feeding during all days and individuals but with a log transformation
+ggplot(daily, aes(log(dayenergy))) + 
+  geom_histogram(binwidth = 0.2) +
+  geom_vline(aes(xintercept = median(log(dayenergy)))) +
+  geom_vline(aes(xintercept = quantile(log(dayenergy), probs = 0.25))) +
+  geom_vline(aes(xintercept = quantile(log(dayenergy), probs = 0.75))) + 
+  geom_vline(aes(xintercept = mean(log(dayenergy)), color = "red")) +
+  geom_density(aes(y=..density..*1000))
+
+#If you want to look at each sex seperately
+vline <- summarise(group_by(daily,gensex), median = log(median(dayenergy)))
+
+ggplot(daily, aes(log(dayenergy))) + 
+  facet_grid("gensex") +
+  geom_histogram(binwidth = 0.2) +
+  geom_vline(data = vline, aes(xintercept = median)) +
+  geom_density(aes(y=..density..*1000))
+
+
+#Total seconds feeding during all days and individuals but with a log transformation. Lines represent 2 sd distnace from mean
+ggplot(daily, aes(log(dayenergy))) + 
+  geom_histogram(binwidth = 0.2) +
+  geom_vline(aes(xintercept = mean(log(dayenergy)), color = "red")) +
+  geom_vline(aes(xintercept = mean(log(dayenergy) + 1.96*sd(log(dayenergy))))) +
+  geom_vline(aes(xintercept = mean(log(dayenergy) - 2*sd(log(dayenergy))))) +
+  geom_vline(aes(xintercept = quantile(log(dayenergy), probs = 0.05))) +
+  geom_density(aes(y=..density..*1000))
+
+#Filters individuals with less than 5 days of data, then looks at the mean daily energy intake for each individual. 
+individual %>% filter(days >= 5) %>%
+  ggplot(aes(meanenergy)) + 
+  geom_histogram(binwidth = 5) +
+  geom_vline(aes(xintercept = quantile(meanenergy, probs = 0.50))) +
+  geom_vline(aes(xintercept = quantile(meanenergy, probs = 0.25))) +
+  geom_vline(aes(xintercept = quantile(meanenergy, probs = 0.75))) +
+  geom_vline(aes(xintercept = mean(meanenergy), color = "red")) +
+  geom_density(aes(y=..density..*1000))
+
+quantile(individual$meanenergy, probs = 0.50) #Median is at 60.3 seconds of feeding
+mean(individual$meanenergy) #Mean is at 97.4 seconds of feeding
+
+#Filters individuals with less than 5 days of data, then looks at the mean daily energy intake for each individual but this time with log transformation
+individual %>% filter(days >= 5) %>%
+  ggplot(aes(log(meanenergy))) + 
+  geom_histogram(binwidth = .1) +
+  geom_vline(aes(xintercept = mean(log(meanenergy)), color = "red")) +
+  geom_vline(aes(xintercept = quantile(log(meanenergy), probs = 0.50))) +
+  geom_vline(aes(xintercept = quantile(log(meanenergy), probs = 0.25))) +
+  geom_vline(aes(xintercept = quantile(log(meanenergy), probs = 0.75))) +
+  geom_density(aes(y=..density..*20))
+
+#Separated by sex
+vline <- individual %>%
+  group_by(gensex) %>%
+  summarise(median = log(median(meanenergy)),
+            mean = log(mean(meanenergy)))
+
+individual %>% filter(days >= 5) %>%
+  ggplot(aes(log(meanenergy))) + 
+  facet_grid("gensex") +
+  geom_histogram(binwidth = .1) +
+  geom_vline(data = vline, aes(xintercept = median)) +
+  geom_vline(data = vline, aes(xintercept = mean, color = "red"))
+  geom_density(aes(y=..density..*20))
+```
+
+
+```{r}
+
+
+#Median daily mean intake is 60 seconds of feeding.  
+dailycut <- daily %>% filter(dayenergy > 60)
+
+#Cutting out days with less than 60 seconds of feeding removes about 39% of the daily data for individuals
+(nrow(daily)-nrow(dailycut))/nrow(daily)
+
+#The data looks pretty similar in terms of shape but you can see the linear relationship has changed
+ggplot(dailycut, aes(dayfeeds, numstation)) + 
+  geom_jitter() +
+  geom_smooth() + 
+  geom_smooth(method = "lm") 
+
+#This remakes the data for individual means but with the cut data
+individualcut <- dailycut %>% 
+  fixplutype(switch = FALSE) %>% filter(!is.na(type)) %>%
+  group_by(name) %>%
+  summarize(type = type, 
+            gensex = gensex, 
+            meandayfeeds = mean(dayfeeds), 
+            meanstation = mean(numstation), 
+            days = n(), 
+            meandur = mean(meandailydur), 
+            meanenergy = mean(dayenergy)) %>%
+  distinct(name, .keep_all = TRUE) 
+
+#Cutting out days with less than 60 seconds of feeding removes about 23% of the individuals
+(nrow(individual)-nrow(individualcut))/nrow(individual)
+
+individual %>% filter(gensex == "m") %>% nrow() #There were originally 103 males
+individualcut %>% filter(gensex == "m") %>% nrow() #After the cut, there are 86 males (lost 17 males, 16%)
+
+individual %>% filter(type == "flf") %>% nrow() #There were originally 36 heterochromes
+individualcut %>% filter(type == "flf") %>% nrow() #After the cut, there are 23 heterochromes (lost 13 heterochromes, 36%)
+
+individual %>% filter(type == "mlf") %>% nrow() #There were originally 15 androchrome females
+individualcut %>% filter(type == "mlf") %>% nrow() #After the cut, there are 9 androchrome females (lost 6 androchrome females, 40%)
+
+#Here's what the individual means look like for each type with the cut
+individualcut %>%
+ggplot(aes(meandayfeeds, meanstation)) + 
+  facet_grid("gensex") +
+  geom_point() +
+  geom_smooth() +
+  geom_smooth(method = "lm", color = "black")
+```
+
+# Join Weight and Morpho Data
+## Prepare weight data to join with behavior data
+## First prepare the morphology data
+Gather the names database to make it long format, better for joins
+```{r}
+names <- nameswide %>%
+  gather(idtype, ids, c(band, 
+                        rfid, 
+                        shortrfid, 
+                        secondrfid, 
+                        secondshortrfid, 
+                        secondband), 
+         na.rm = TRUE)
+```
+
+Prepare the capture dataset especially for plumage information
+```{r}
+
+caps <- captures %>%
+  filter(species == "fmel") %>%
+  select(name,
+         species,
+         date_captured, 
+         plutype,
+         mass, 
+         corrugations, 
+         unusualplu, 
+         uplu_orangeface,
+         wingchord,
+         wingdepth,
+         tail,
+         nare,
+         culmen) %>%
+  mutate(date_captured = lubridate::dmy(date_captured)) %>%
+  arrange(name, date_captured) %>%
+  left_join(sexes, by = "name") %>%
+  dplyr::select(-extractionID, -band, -rfid, -uniquerfid, -extractionyear)
+
+```
+
+```{r}
+measures <- caps %>% 
+  select(name, wingchord, tail, mass, nare, corrugations) %>%
+  distinct(name, .keep_all = TRUE) %>%
+  filter(wingchord > 56)
+```
+
+## Now prepare the muscle capacity data
+Select the relevant data from the weights dataset and join it with names
+```{r}
+weightnames <- weightswide %>%
+  filter(!is.na(date)) %>%
+  filter(species == "flo") %>%
+  dplyr::select(date, newdate, species, ID, '1', '2', '3', '4', '5', '6', '7', '8', '9', '10') %>%
+  left_join(names, by = c("ID" = "ids")) %>%
+  dplyr::select(-Mountname, -idtype) %>%
+  mutate(date = lubridate::dmy(date)) %>%
+  filter(!is.na(name))
+
+```
+
+Some experiment dates were unaccounted for in the capture data set. I went through and fixed the dates by using the dates on the videos and put these into the "newdate" column. Need to make another date column with all the correct dates
+```{r}
+#Creates a dataframe that gives unique name to each capture "namedate" in the capture dataset
+capsx <- caps %>%
+  dplyr::select(date_captured, name) %>%
+  unite(namedate, c(name, date_captured))
+
+#Creates a dataframe that gives unique name to each weight experiment "namedate" in the weight dataset.
+#Then makes a column that checks whether the namedate in weights is in the capture dataset
+weightx <- weightnames %>%
+  dplyr::select(date, name) %>%
+  unite(namedate, c(name, date)) %>%
+  mutate(exist = namedate %in% capsx$namedate)
+
+#List all the experiment dates that are not in the capture dataset
+notincaps <- weightx %>% filter(!exist)
+
+#Corrected dates are now in the column "newdate" 
+
+#If there is something in newdate, use that date, if not, use the original date
+weightdate <- weightnames %>% mutate(date_correct = if_else(!is.na(newdate), newdate, date)) %>% select(-date, -newdate)
+
+#Now check if there are any more individuals that don't have a date in the capture set
+weightx2 <- weightdate %>%
+  select(date_correct, name) %>%
+  unite(namedate, c(name, date_correct)) %>%
+  mutate(exist = namedate %in% capsx$namedate)
+
+#The only one that is not accounted for is Nicole on 2018-11-30. This date is not in the capture data for Nicole so it should be removed
+weightx2 %>% filter(!exist)
+
+```
+
+Now we can match the mass on the exact date of the experiment
+```{r}
+
+#First prepare the sex datasex. Just take name and genetic sex
+sex <- sexes %>% select(name, gensex)
+
+#Join it with the capture data. Bring together name and date to make an individual ID for each capture
+capsex <- caps %>%
+  unite(namedate, c(name, date_captured))
+
+#Join with the capture data with the weight lifting data using namedate
+weightcaps <- weightdate %>%
+  unite(namedate, c(name, date_correct)) %>%
+  inner_join(capsex, by = "namedate")
+```
+
+Now prep the data with all the data and put it in the right format if we want to use the mean lift to do the analysis
+```{r}
+
+masslevels <- weightlevels %>% rename(beadmass = mass)
+
+weightdata_means <- weightcaps %>%
+  #First make all the lift data into long format
+  pivot_longer(3:12, names_to = "liftnum", values_to = "beads") %>% 
+  #Join the actual mass of the beads
+  left_join(masslevels, by = c("beads" = "level")) %>%
+  #Make the number of beads a factor
+  mutate(liftnum = as.numeric(liftnum)) %>%
+  #Number of lifts goes all the way to 10, but if the bird didn't lift that many it leaves an NA, so take those NAs out
+  filter(!is.na(beadmass)) %>%
+  #Group everything by the experiment namedate and summarize the mean and number of lifts, plus keep all the rest of the data
+  group_by(namedate) %>%
+  summarize(meanlift = mean(beadmass),
+            lifts = n(),
+            gensex = gensex[1], 
+            plutype = plutype[1], 
+            mass = mass[1], 
+            corrugations = corrugations[1], 
+            unusualplu = unusualplu[1], 
+            uplu_orangeface = uplu_orangeface[1],
+            wingchord = wingchord[1]) %>%
+  #Take out any individuals that aren't sexed
+  filter(!is.na(gensex)) %>%
+  #Take out the mix plumage types
+  filter(plutype != "mix") %>%
+  #Divide up the namedate column back into two seperate name and date collumns
+  mutate(name = sapply(strsplit(namedate, split = "_", fixed = TRUE), function(x) (x[1]))) %>%
+  mutate(date = sapply(strsplit(namedate, split = "_", fixed = TRUE), function(x) (x[2]))) %>%
+  #Change the date back into a date type
+  mutate(date = lubridate::ymd(date)) %>%
+  #Only keep experiments where there are at least 3 lifts
+  filter(lifts > 3) %>%
+  #Add a column for lift total (including bird mass), and the amount lifted per gram of body mass
+  mutate(totlift = mass + meanlift,
+         pergram = meanlift/mass) %>%
+  arrange(name, date) %>%
+  distinct(name, .keep_all = TRUE) %>%
+  mutate(type = if_else(
+    gensex == "m" & plutype == "m", "mlm", if_else(
+      gensex == "f" & plutype == "f", "flf", if_else(
+        gensex == "f" & plutype == "m", "mlf", NULL))))
+
+# Simplify for using in joins
+weightdata_means1 <- weightdata_means %>% select(name, meanlift, pergram, totlift)
+  
+```
+
+## Combine datasets
+Now combine the data with the measurements
+```{r}
+#Use this for a cut dataset without days that had <60 sec of feeding
+indcut_measures <- individualcut %>%
+  inner_join(measures, by = "name") %>% 
+  inner_join(weightdata_means1, by = "name") %>%
+  mutate(highlow = if_else(meandayfeeds >= 25, "high", "low"))
+
+#Use this for a full dataset without cutting
+ind_measures <- individual %>%
+  inner_join(measures, by = "name") %>%
+  inner_join(weightdata_means1, by = "name") %>%
+  mutate(highlow = if_else(meandayfeeds >= 25, "high", "low"))
+```
+
+# Identifying Strategies
+
+## Identify the territorials and non-territorials
+
+Individuals that do many feeds
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+# Taking a look at this graph again, it seems like after 75 feeds per day there's a high frequency, low station number per day strategy, and above 5 stations per day, there's a high stations, low frequency strategy. Let's identify any individuals that ever went above 75 feeds per day. 
+ggplot(dailycut, aes(dayfeeds, numstation)) + 
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+
+feedcut <- 60
+stationcut <- 5
+
+#Make a list of all the individuals that did more than 75 feeds in a day at least once
+manyfeeds_cut <- dailycut %>%
+  filter(dayfeeds > feedcut) %>%
+  filter(numstation < stationcut) %>%
+  distinct(name)
+
+manyfeeds <- daily %>%
+   filter(dayfeeds > feedcut) %>%
+   filter(numstation < stationcut) %>%
+   distinct(name)
+
+#What does the plot of these manyfeedindividuals look like? 
+#Those that do many feeds seem to exhibit all strategies
+dailycut %>% filter(name %in% manyfeeds$name) %>%
+ggplot(aes(dayfeeds, maxdist)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+```
+Individuals that do many stations
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+#Make a list of all the individuals that NEVER did more than 75 feeds in a day, and that at least once did at least 6 feeders in a day
+manystations_cut <- dailycut %>%
+  filter(numstation > stationcut) %>%
+  filter(name %notin% manyfeeds$name) %>%
+  distinct(name)
+
+manystations <- daily %>%
+  filter(numstation > stationcut) %>%
+  filter(name %notin% manyfeeds_cut$name) %>%
+  distinct(name)
+
+#What does the plot of these manystation individuals look like? 
+dailycut %>% filter(name %in% manystations_cut$name) %>% 
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+
+#Note that there are more females here
+```
+Individuals that do low station and low feed 
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+#These are the individuals who were NEVER territorial nor went to a lot of feeders
+lowboth_cut <- dailycut %>%
+  filter(name %notin% manyfeeds$name) %>%
+  filter(name %notin% manystations$name) %>%
+  distinct(name)
+
+lowboth <- daily %>%
+  filter(name %notin% manyfeeds$name) %>%
+  filter(name %notin% manystations$name) %>%
+  distinct(name)
+
+#What does the plot of these lowboth individuals look like? 
+dailycut %>% filter(name %in% lowboth$name) %>% 
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+```
+Individuals that are low feed but any number of station
+```{r}
+
+lowfeeds_cut <- dailycut %>%
+  filter(name %notin% manyfeeds$name) %>%
+  distinct(name)
+
+lowfeeds <- daily %>%
+  filter(name %notin% manyfeeds$name) %>%
+  distinct(name)
+
+#What does the plot of these lowboth individuals look like? 
+dailycut %>% filter(name %in% lowfeeds$name) %>% 
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+```
+
+Do some quick comparisons with the cut data
+```{r}
+indF <- indcut_measures %>% filter(gensex == "f")
+indM <- indcut_measures %>% filter(gensex == "m")
+
+indhigh <- indcut_measures %>% filter(highlow == "high")
+indlow <- indcut_measures %>% filter(highlow == "low")
+
+stratfeeds <- indcut_measures %>% filter(name %in% manyfeeds_cut$name) %>% mutate(strat = "feeds")
+stratstations <- indcut_measures %>% filter(name %in% manystations_cut$name) %>% mutate(strat = "stations")
+stratlow <- indcut_measures %>% filter(name %in% lowboth_cut$name) %>% mutate(strat = "lowboth")
+strategy <- rbind(stratfeeds, stratstations, stratlow)
+
+strategy %>% group_by(gensex) %>% summarise(n())
+stratlow %>% group_by(gensex) %>% summarise(n())
+19/30
+37/70
+
+strategy %>% group_by(gensex) %>% summarise(n())
+stratstations %>% group_by(gensex) %>% summarise(n())
+10/30
+16/70
+
+#Significant between high station and 
+shapiro.test(indcut_measures$meanlift)
+t.test(stratfeeds$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratfeeds$meanlift)
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(stratfeeds$corrugations, stratstations$corrugations)
+```
+
+Do some quick comparisons with the full data
+```{r}
+indF <- ind_measures %>% filter(gensex == "f")
+indM <- ind_measures %>% filter(gensex == "m")
+
+indhigh <- ind_measures %>% filter(highlow == "high")
+indlow <- ind_measures %>% filter(highlow == "low")
+
+stratfeeds <- ind_measures %>% filter(name %in% manyfeeds$name) %>% mutate(strat = "feeds")
+stratstations <- ind_measures %>% filter(name %in% manystations$name) %>% mutate(strat = "stations")
+stratlow <- ind_measures %>% filter(name %in% lowboth$name) %>% mutate(strat = "lowboth")
+strategy <- rbind(stratfeeds, stratstations, stratlow)
+
+shapiro.test(ind_measures$meanlift)
+t.test(stratfeeds$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratfeeds$meanlift)
+
+#These are significant or close
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(indhigh$corrugations, indlow$corrugations)
+```
+
+Do some quick comparisons with the cut data, but just with 2 strategies rather than 3
+```{r}
+indF <- indcut_measures %>% filter(gensex == "f")
+indM <- indcut_measures %>% filter(gensex == "m")
+
+indhigh <- indcut_measures %>% filter(highlow == "high")
+indlow <- indcut_measures %>% filter(highlow == "low")
+
+stratfeedsH <- indcut_measures %>% filter(name %in% manyfeeds_cut$name) %>% mutate(strat = "H")
+stratfeedsL <- indcut_measures %>% filter(name %in% lowfeeds_cut$name) %>% mutate(strat = "L")
+strategy <- rbind(stratfeedsH, stratfeedsL)
+
+#None of these are significant
+shapiro.test(indcut_measures$meanlift)
+t.test(stratfeedsH$meanlift, stratfeedsL$meanlift)
+t.test(stratfeedsH$mass, stratfeedsL$mass)
+t.test(stratfeedsH$wingchord, stratfeedsL$wingchord)
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(stratfeedsH$corrugations, stratfeedsL$corrugations)
+```
+
+Do some quick comparisons with the full data, but just with 2 strategies rather than 3
+```{r}
+indF <- ind_measures %>% filter(gensex == "f")
+indM <- ind_measures %>% filter(gensex == "m")
+
+indhigh <- ind_measures %>% filter(highlow == "high")
+indlow <- ind_measures %>% filter(highlow == "low")
+
+stratfeedsH <- ind_measures %>% filter(name %in% manyfeeds$name) %>% mutate(strat = "H")
+stratfeedsL <- ind_measures %>% filter(name %in% lowfeeds$name) %>% mutate(strat = "L")
+strategy <- rbind(stratfeedsH, stratfeedsL)
+
+#None of these are significant
+shapiro.test(ind_measures$meanlift)
+t.test(stratfeedsH$meanlift, stratfeedsL$meanlift)
+t.test(stratfeedsH$mass, stratfeedsL$mass)
+t.test(stratfeedsH$wingchord, stratfeedsL$wingchord)
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(stratfeedsH$corrugations, stratfeedsL$corrugations)
+wilcox.test(indhigh$corrugations, indlow$corrugations)
+```
+
+```{r}
+modfeed <- lm(meanlift ~ strat, data = strategy)
+modfeed.1 <- lm(meanlift ~ 1, data = strategy)
+summary(modfeed)
+
+anova(modfeed, modfeed.1)
+
+library(emmeans)
+
+emmeans(modfeed, pairwise ~ strat, type = "response")
+
+modfeed <- lm(meandayfeeds ~ meanlift, data = indcut_measures)
+summary(modfeed)
+```
+
+## Let's go back to the cut stage
+```{r}
+#If you want to look at each sex seperately
+vline <- summarise(group_by(daily,gensex), median = median(dayenergy))
+
+daily %>% 
+ggplot(aes(dayenergy)) + 
+  facet_grid("gensex") +
+  geom_histogram(binwidth = 1) +
+  geom_vline(data = vline, aes(xintercept = median))
+
+dailym <- daily %>% filter(gensex == "m")
+dailyf <- daily %>% filter(gensex == "f")
+
+quantile(daily$dayenergy, probs = .5)
+quantile(dailyf$dayenergy, probs = .5)
+quantile(dailym$dayenergy, probs = .5)
+
+individualm <- individual %>% filter(gensex == "m")
+individualf <- individual %>% filter(gensex == "f")
+
+quantile(individual$meanenergy, probs = .5)
+quantile(individualm$meanenergy, probs = .5) #The median mean energy per day is 69.2 seconds for MALES
+quantile(individualf$meanenergy, probs = .5) #The median mean energy per day is 46.2 seconds for FEMALES
+```
+
+```{r}
+dailycutm <- daily %>% 
+  filter(gensex == "m") %>%
+  filter(dayenergy > 69)
+
+dailycutf <- daily  %>% 
+  filter(gensex == "f") %>%
+  filter(dayenergy > 46)
+
+dailycut <- rbind(dailycutm, dailycutf)
+
+#Cutting out days this way removes about 40% of the daily data for individuals
+(nrow(daily)-nrow(dailycut))/nrow(daily)
+
+#This remakes the data for individual means but with the cut data
+individualcut <- dailycut %>% 
+  fixplutype(switch = FALSE) %>% filter(!is.na(type)) %>%
+  group_by(name) %>%
+  summarize(type = type, 
+            gensex = gensex, 
+            meandayfeeds = mean(dayfeeds), 
+            meanstation = mean(numstation), 
+            days = n(), 
+            meandur = mean(meandailydur), 
+            meanenergy = mean(dayenergy)) %>%
+  distinct(name, .keep_all = TRUE) 
+
+#Cutting out days this way removes about 23% of the individuals
+(nrow(individual)-nrow(individualcut))/nrow(individual)
+
+individual %>% filter(gensex == "m") %>% nrow() #There were originally 103 males
+individualcut %>% filter(gensex == "m") %>% nrow() #After the cut, there are 84 males (lost 19 males, 23%)
+
+individual %>% filter(gensex == "f") %>% nrow() #There were originally 51 females
+individualcut %>% filter(gensex == "f") %>% nrow() #After the cut, there are 35 heterochromes (lost 16 females, 31%)
+
+#Here's what the individual means look like for each type with the cut
+individualcut %>%
+ggplot(aes(meandayfeeds, meanstation)) + 
+  facet_grid("type") +
+  geom_point() +
+  geom_smooth() +
+  geom_smooth(method = "lm", color = "black")
+```
+Now combine the data with the measurements
+```{r}
+#Use this for a cut dataset 
+indcut_measures <- individualcut %>%
+  inner_join(measures, by = "name") %>% 
+  inner_join(weightdata_means1, by = "name") %>%
+  mutate(highlow = if_else(meandayfeeds >= 25, "high", "low"))
+
+#Use this for a full dataset without cutting
+ind_measures <- individual %>%
+  inner_join(measures, by = "name") %>%
+  inner_join(weightdata_means1, by = "name") %>%
+  mutate(highlow = if_else(meandayfeeds >= 25, "high", "low"))
+```
+
+Just a useful function. Opposite of %in%
+```{r}
+`%notin%` <- Negate(`%in%`)
+```
+
+Individuals that do many feeds
+```{r}
+# Taking a look at this graph again, it seems like after 75 feeds per day there's a high frequency, low station number per day strategy, and above 5 stations per day, there's a high stations, low frequency strategy. Let's identify any individuals that ever went above 75 feeds per day. 
+ggplot(dailycut, aes(dayfeeds, numstation)) + 
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+
+feedcut <- 60
+stationcut <- 5
+
+#Make a list of all the individuals that did more than 75 feeds in a day at least once
+manyfeeds_cut <- dailycut %>%
+  filter(dayfeeds > feedcut) %>%
+  distinct(name)
+
+manyfeeds <- daily %>%
+   filter(dayfeeds > feedcut) %>%
+   filter(numstation < stationcut) %>%
+   distinct(name)
+
+#What does the plot of these manyfeedindividuals look like? 
+#Those that do many feeds seem to exhibit all strategies
+dailycut %>% filter(name %in% manyfeeds$name) %>%
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+```
+
+Individuals that do many stations
+```{r}
+#Make a list of all the individuals that NEVER did more than 75 feeds in a day, and that at least once did at least 6 feeders in a day
+manystations_cut <- dailycut %>%
+  filter(numstation > stationcut) %>%
+  filter(name %notin% manyfeeds_cut$name) %>%
+  distinct(name)
+
+manystations <- daily %>%
+  filter(numstation > stationcut) %>%
+  filter(name %notin% manyfeeds$name) %>%
+  distinct(name)
+
+#What does the plot of these manystation individuals look like? 
+dailycut %>% filter(name %in% manystations$name) %>% 
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+
+#Note that there are more females here
+```
+
+Individuals that do low station and low feed 
+```{r}
+#These are the individuals who were NEVER territorial nor went to a lot of feeders
+lowboth_cut <- dailycut %>%
+  filter(name %notin% manyfeeds_cut$name) %>%
+  filter(name %notin% manystations_cut$name) %>%
+  distinct(name)
+
+lowboth <- daily %>%
+  filter(name %notin% manyfeeds$name) %>%
+  filter(name %notin% manystations$name) %>%
+  distinct(name)
+
+#What does the plot of these lowboth individuals look like? 
+dailycut %>% filter(name %in% lowboth$name) %>% 
+ggplot(aes(dayfeeds, numstation)) + 
+  facet_grid("gensex") +
+  geom_jitter(aes(col = name)) +
+  geom_smooth() + 
+  geom_smooth(method = "lm") +
+  theme(legend.position = "none")
+```
+
+Do some quick comparisons with the cut data
+```{r}
+indF <- indcut_measures %>% filter(gensex == "f")
+indM <- indcut_measures %>% filter(gensex == "m")
+
+indhigh <- indcut_measures %>% filter(highlow == "high")
+indlow <- indcut_measures %>% filter(highlow == "low")
+
+stratfeeds <- indcut_measures %>% filter(name %in% manyfeeds_cut$name) %>% mutate(strat = "feeds")
+stratstations <- indcut_measures %>% filter(name %in% manystations_cut$name) %>% mutate(strat = "stations")
+stratlow <- indcut_measures %>% filter(name %in% lowboth_cut$name) %>% mutate(strat = "lowboth")
+strategy <- rbind(stratfeeds, stratstations, stratlow)
+
+#Significant between high station and 
+shapiro.test(indcut_measures$meanlift)
+t.test(stratfeeds$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratfeeds$meanlift)
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(stratfeeds$corrugations, stratstations$corrugations)
+```
+
+Do some quick comparisons with the full data
+```{r}
+indF <- ind_measures %>% filter(gensex == "f")
+indM <- ind_measures %>% filter(gensex == "m")
+
+indhigh <- ind_measures %>% filter(highlow == "high")
+indlow <- ind_measures %>% filter(highlow == "low")
+
+stratfeeds <- ind_measures %>% filter(name %in% manyfeeds$name) %>% mutate(strat = "feeds")
+stratstations <- ind_measures %>% filter(name %in% manystations$name) %>% mutate(strat = "stations")
+stratlow <- ind_measures %>% filter(name %in% lowboth$name) %>% mutate(strat = "lowboth")
+strategy <- rbind(stratfeeds, stratstations, stratlow)
+
+#None of these are significant
+shapiro.test(ind_measures$meanlift)
+t.test(stratfeeds$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratstations$meanlift)
+t.test(stratlow$meanlift, stratfeeds$meanlift)
+
+#These are significant or close
+t.test(indhigh$meanlift, indlow$meanlift)
+t.test(indhigh$mass, indlow$mass)
+t.test(indhigh$wingchord, indlow$wingchord)
+
+shapiro.test(ind_measures$corrugations)
+wilcox.test(indhigh$corrugations, indlow$corrugations)
+```
+
+```{r}
+modfeed <- lm(meanlift ~ strat, data = strategy)
+summary(modfeed)
+
+library(emmeans)
+
+emmeans(modfeed, pairwise ~ strat, type = "response")
+
+modfeed <- lm(meandayfeeds ~ meanlift, data = indcut_measures)
+summary(modfeed)
+```
+
+
+```{r}
+strategyalt <- rbind(stratfeeds, stratstations)
+
+ggplot(strategyalt, aes(x = meandayfeeds, y = meanlift)) +
+  geom_point() +
+  geom_smooth(method = lm)
+
+lm(meanlift ~ meandayfeeds + gensex, data = strategyalt) %>% summary()
+
+```
+
+
+# Visualization
+## Initializations
+Initialize the map
+```{r}
+library(ggmap)
+library(colorspace)
+
+library(devtools)
+install_github("dkahle/ggmap")
+library(ggmap)
+
+cbbox <- make_bbox(lon = latlong$long, lat = latlong$lat, f = .1)
+sq_map <- get_map(location = cbbox, maptype = "terrain", source = "stamen")
+```
+
+Try to make a function that spits out maps
+```{r}
+
+gamboamap <- function(bird, dayfeed, map){
+  #Read in the station datapoints
+  
+  periodfeeders = case_when(dayfeed >= "2018-01-20" & dayfeed <= "2018-02-02" ~ "a",
+                     dayfeed >= "2018-02-03" & dayfeed <= "2018-03-08" ~ "b",
+                     dayfeed >= "2018-03-09" & dayfeed <= "2018-05-11" ~ "c",
+                     dayfeed >= "2018-05-12" & dayfeed <= "2018-06-01" ~ "d",
+                     dayfeed >= "2018-10-08" & dayfeed <= "2019-02-17" ~ "e",
+                     dayfeed >= "2019-02-18" & dayfeed <= "2019-05-31" ~ "f")
+  
+  latlong <- read_csv("readerschedule2.csv") %>%
+      filter(period == periodfeeders)
+
+#Read in the station datapoints
+  latlong <- read_csv("readerschedule2.csv") %>%
+    filter(period == periodfeeders)
+  
+  datamap <- nonmix %>%
+    filter(name == bird, day == dayfeed) %>% 
+    arrange(starttime) %>%
+    select(starttime, station, name) %>%
+    mutate(nextfeed = lead(station)) %>% 
+    mutate(switch = if_else(station == nextfeed,F, T)) %>%
+    mutate(daytime = hms::as_hms(format(starttime, format = "%H:%M:%S"))) %>%
+    mutate(periodlength = lubridate::hms(daytime)) %>%
+    mutate(seconds = period_to_seconds(periodlength)) %>%
+    inner_join(latlong) %>% 
+    mutate(long = jitter(long, amount = .0001), lat = jitter(lat, amount = 0.0001))
+  
+  #get the number of feeds per sation
+  feedpoints <- datamap %>% 
+    group_by(station) %>% 
+    summarize(countstation = n()) %>% 
+    inner_join(latlong)
+  #map it
+  mapit <- ggmap(map) + 
+    geom_point(aes(x = long, y = lat), data = latlong,
+               alpha = .5, color="black", size = 3) +
+  geom_point(aes(x = long, y = lat, col = seconds), data = datamap,
+               alpha = .5) +
+  stat_density_2d(aes(x = long, y = lat), data = datamap, alpha = 0.5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_path(data = datamap, aes(x = long, y = lat, color = seconds), 
+            size = 1, lineend = "round", alpha = 0.5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_text(aes(x = long, y = lat, label = countstation), 
+            position = position_nudge(y = -0.0003), data = feedpoints)+
+    labs(x = " ", y = " ", title = str_c(bird, " ", dayfeed)) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.ticks.x=element_blank())
+  
+return(mapit)
+}
+
+gamboamap(bird = "Arizbel", dayfeed = "2019-04-04", map = sq_map)
+
+
+#Make a map with no actual background map
+gamboapoints <- function(bird, dayfeed){
+  
+  periodfeeders = case_when(dayfeed >= "2018-01-20" & dayfeed <= "2018-02-02" ~ "a",
+                     dayfeed >= "2018-02-03" & dayfeed <= "2018-03-08" ~ "b",
+                     dayfeed >= "2018-03-09" & dayfeed <= "2018-05-11" ~ "c",
+                     dayfeed >= "2018-05-12" & dayfeed <= "2018-06-01" ~ "d",
+                     dayfeed >= "2018-10-08" & dayfeed <= "2019-02-17" ~ "e",
+                     dayfeed >= "2019-02-18" & dayfeed <= "2019-05-31" ~ "f")
+  
+  #Read in the station datapoints
+  latlong <- read_csv("readerschedule2.csv") %>%
+    filter(period == periodfeeders)
+  
+  datamap <- nonmix %>%
+    filter(name == bird, day == dayfeed) %>% 
+    arrange(starttime) %>%
+    select(starttime, station, name) %>%
+    mutate(nextfeed = lead(station)) %>% 
+    mutate(switch = if_else(station == nextfeed,F, T)) %>%
+    mutate(daytime = hms::as_hms(format(starttime, format = "%H:%M:%S"))) %>%
+    mutate(periodlength = lubridate::hms(daytime)) %>%
+    mutate(seconds = period_to_seconds(periodlength)) %>%
+    inner_join(latlong) %>% 
+    mutate(long = jitter(long, amount = .0001), lat = jitter(lat, amount = 0.0001))
+  
+  #get the number of feeds per sation
+  feedpoints <- datamap %>% 
+    group_by(station) %>% 
+    summarize(countstation = n()) %>% 
+    inner_join(latlong)
+  
+  mapit <- ggplot() + 
+    stat_density_2d(aes(x = long, y = lat, alpha = 0.25), data = datamap) +
+   geom_point(aes(x = long, y = lat), data = latlong,
+               alpha = .5, color="black", size = 3) +
+  geom_point(aes(x = long, y = lat, col = seconds), data = datamap,
+               alpha = .5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_path(data = datamap, aes(x = long, y = lat, color = seconds), 
+            size = 1, lineend = "round", alpha = 0.5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_text(aes(x = long, y = lat, label = countstation), 
+            position = position_nudge(y = -0.0003), data = feedpoints) +
+  labs(x = " ", y = " ", title = str_c(bird, " ", dayfeed)) +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.ticks.x=element_blank())
+  
+  
+return(mapit)
+}
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-04")
+
+```
+
+
+
+
+## Take a look at what a few territorial birds look like on the map
+
+It looks like Arizbel was a many-feeds bird on 2019-04-04. What does the visitation map look like? 
+```{r}
+#Pull the data
+Arizbel_20190404 <- nonmix %>% 
+  filter(name == "Arizbel", day == "2019-04-04") %>% 
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+#How often did Arizbel go to each feeder?
+Arizbel_20190404 %>% group_by(station) %>% summarize(count = n())
+#How often did Arizbel switch to a different feeder during the day
+Arizbel_20190404 %>% group_by(switch) %>% summarize(count = n())
+
+#Show us the map
+gamboapoints("Arizbel", "2019-04-04")
+
+# ggmap(sq_map) + 
+#   geom_point(aes(x = long, y = lat), data = latlong,  
+#              alpha = .5, color="darkred", size = 2) +
+#   geom_path(data = Arizbel_20190404, aes(x = long, y = lat, color = starttime), 
+#             size = 1, lineend = "round") +
+#   labs(x = " ", y = " ", title = "Inividual tracks") +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+```
+
+What did Arizbel do on the day afterward, 2019-04-05?
+```{r}
+#Pull the data
+Arizbel_20190405 <- nonmix %>% 
+  filter(name == "Arizbel", day == "2019-04-05") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+#Feeds at each station
+Arizbel_20190405 %>% group_by(station) %>% summarize(count = n())
+#Number of feeder switches
+Arizbel_20190405 %>% group_by(switch) %>% summarize(count = n())
+
+#Show us the map
+gamboapoints("Arizbel", "2019-04-05")
+# ggmap(sq_map) + 
+#   geom_point(aes(x = long, y = lat), data = latlong,  
+#              alpha = .5, color="darkred", size = 1) +
+#   geom_path(data = Arizbel_20190405, aes(x = long, y = lat, color = starttime), 
+#             size = 1, lineend = "round") +
+#   labs(x = " ", y = " ", title = "Inividual tracks") +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+```
+
+Look at just one more many-feeds bird
+```{r}
+Diana_20190514 <- nonmix %>% 
+  filter(name == "Diana", day == "2019-05-14") %>% 
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Diana_20190514 %>% group_by(station) %>% summarize(count = n())
+Diana_20190514 %>% group_by(switch) %>% summarize(count = n())
+
+gamboapoints("Diana", "2019-05-14")
+# ggmap(sq_map) + 
+#   geom_point(aes(x = long, y = lat), data = latlong,  
+#              alpha = .5, color="darkred", size = 1) +
+#   geom_path(data = Diana_20190514, aes(x = long, y = lat, color = starttime), 
+#             size = 1, lineend = "round") +
+#   labs(x = " ", y = " ", title = "Inividual tracks") +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+```
+
+What if we look at a many-feeds bird over several days? Let's try Arizbel
+```{r}
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-04", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-05", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-06", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-07", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-08", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-09", map = sq_map)
+# gamboamap(bird = "Arizbel", dayfeed = "2019-04-10", map = sq_map)
+
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-04")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-05")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-06")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-07")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-08")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-09")
+gamboapoints(bird = "Arizbel", dayfeed = "2019-04-10")
+
+# gamboamap(bird = "Arizbel", dayfeed = "2017-01-01", map = sq_map) %>% ggsave(filename = "blankmap.png", height = 4, width = 8)
+
+```
+
+## Take a look at what a few many-stations birds look like
+
+Joseph went to a ton of feeders on 2019-04-16
+```{r}
+#Pull the data 
+Joseph_20190406 <- nonmix %>% 
+  filter(name == "Joseph", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>% 
+  inner_join(latlong)
+
+Joseph_20190406 %>% group_by(station) %>% summarize(count = n())
+Joseph_20190406 %>% group_by(switch) %>% summarize(count = n())
+
+gamboapoints("Joseph", "2019-04-06")
+gamboamap("Joseph", "2019-04-06", map = sq_map)
+
+# ggmap(sq_map) + 
+#   geom_point(aes(x = long, y = lat), data = latlong,  
+#              alpha = .5, color="darkred", size = 1) +
+#   geom_path(data = Joseph_20190406, aes(x = long, y = lat, color = starttime), 
+#             size = 1, lineend = "round") +
+#   labs(x = " ", y = " ", title = "Inividual tracks") +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+
+```
+
+
+Here's another many-feed individual
+```{r}
+Flor_20180508 <- nonmix %>%
+  filter(name == "Flor", day == "2018-05-08") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Flor_20180508 %>% group_by(station) %>% summarize(count = n())
+Flor_20180508 %>% group_by(switch) %>% summarize(count = n())
+
+gamboapoints("Flor", "2018-05-08")
+# ggmap(sq_map) + 
+#   geom_point(aes(x = long, y = lat), data = latlong,  
+#              alpha = .5, color="darkred", size = 1) +  
+#   geom_path(data = Flor_20180508, aes(x = long, y = lat, color = starttime), 
+#             size = 1, lineend = "round") +
+#   labs(x = " ", y = " ", title = "Inividual tracks") +
+#   theme_minimal() +
+#   theme(legend.position = "none")
+```
+
+Just one more many-feeds example
+```{r}
+Thomas_20190514 <- nonmix %>%
+  filter(name == "Thomas", day == "2019-05-14") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong) %>%
+  mutate(starttime = format(starttime, format = "%H:%M:%S"))
+
+Thomas_20190514 %>% group_by(station) %>% summarize(count = n())
+Thomas_20190514 %>% group_by(switch) %>% summarize(count = n())
+
+gamboapoints("Thomas", "2019-05-14")
+ggmap(sq_map) + 
+  geom_path(data = Thomas_20190514, aes(x = long, y = lat, colour = starttime), 
+            size = 1, lineend = "round") +
+  scale_colour_gradientn(color = rainbow_hcl(7)) +
+  geom_point(aes(x = long, y = lat), data = latlong,  
+             alpha = .5, color="darkred", size = 1) +
+  labs(x = " ", y = " ", title = "Individual tracks") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+What if we look at a many-feeds bird over several days? Let's try Joseph
+```{r}
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-06") %>% ggsave(filename = "map1.png", height = 4, width = 8)
+map1 <- image_read("map1.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-07") %>% ggsave(filename = "map2.png", height = 4, width = 8)
+map2 <- image_read("map2.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-08") %>% ggsave(filename = "map3.png", height = 4, width = 8)
+map3 <- image_read("map3.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-09") %>% ggsave(filename = "map4.png", height = 4, width = 8)
+map4 <- image_read("map4.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-10") %>% ggsave(filename = "map5.png", height = 4, width = 8)
+map5 <- image_read("map5.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-11") %>% ggsave(filename = "map6.png", height = 4, width = 8)
+map6 <- image_read("map6.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-12") %>% ggsave(filename = "map7.png", height = 4, width = 8)
+map7 <- image_read("map7.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-13") %>% ggsave(filename = "map8.png", height = 4, width = 8)
+map8 <- image_read("map8.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-14") %>% ggsave(filename = "map9.png", height = 4, width = 8)
+map9 <- image_read("map9.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-15") %>% ggsave(filename = "map10.png", height = 4, width = 8)
+map10 <- image_read("map10.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-16") %>% ggsave(filename = "map11.png", height = 4, width = 8)
+map11 <- image_read("map11.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-17") %>% ggsave(filename = "map12.png", height = 4, width = 8)
+map12 <- image_read("map12.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-18") %>% ggsave(filename = "map13.png", height = 4, width = 8)
+map13 <- image_read("map13.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-19") %>% ggsave(filename = "map14.png", height = 4, width = 8)
+map14 <- image_read("map14.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-20") %>% ggsave(filename = "map15.png", height = 4, width = 8)
+map15 <- image_read("map15.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-21") %>% ggsave(filename = "map16.png", height = 4, width = 8)
+map16 <- image_read("map16.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-22") %>% ggsave(filename = "map17.png", height = 4, width = 8)
+map17 <- image_read("map17.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-23") %>% ggsave(filename = "map18.png", height = 4, width = 8)
+map18 <- image_read("map18.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-24") %>% ggsave(filename = "map19.png", height = 4, width = 8)
+map19 <- image_read("map19.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-25") %>% ggsave(filename = "map20.png", height = 4, width = 8)
+map20 <- image_read("map20.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-26") %>% ggsave(filename = "map21.png", height = 4, width = 8)
+map21 <- image_read("map21.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-27") %>% ggsave(filename = "map22.png", height = 4, width = 8)
+map22 <- image_read("map22.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-28") %>% ggsave(filename = "map23.png", height = 4, width = 8)
+map23 <- image_read("map23.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-29") %>% ggsave(filename = "map24.png", height = 4, width = 8)
+map24 <- image_read("map24.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-04-30") %>% ggsave(filename = "map25.png", height = 4, width = 8)
+map25 <- image_read("map25.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-01") %>% ggsave(filename = "map26.png", height = 4, width = 8)
+map26 <- image_read("map26.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-02") %>% ggsave(filename = "map27.png", height = 4, width = 8)
+map27 <- image_read("map27.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-03") %>% ggsave(filename = "map28.png", height = 4, width = 8)
+map28 <- image_read("map28.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-04") %>% ggsave(filename = "map29.png", height = 4, width = 8)
+map29 <- image_read("map29.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-05") %>% ggsave(filename = "map30.png", height = 4, width = 8)
+map30 <- image_read("map30.png")
+gamboapoints(bird = "Joseph", dayfeed = "2019-05-06") %>% ggsave(filename = "map31.png", height = 4, width = 8)
+map31 <- image_read("map31.png")
+
+img <- c(map1, map2, map3, map4, map5, map6, map7, map8, map9, map10, map11, map12, map13, map14, map15, map16, map17, map18, map19, map20, map21, map22, map23, map24, map25, map26, map27, map28, map29, map30, map21)
+Joseph20190406to0506 <- image_animate(image_scale(img, "1200x1200"), fps = , dispose = "previous")
+image_write_video(Joseph20190406to0506, "Joseph20190406to0506.mp4", framerate = 1.5)
+
+
+```
+
+What if we look at a many-feeds bird over several days? Let's try Joseph
+```{r}
+gamboamap(bird = "Joseph", dayfeed = "2019-04-06", map = sq_map) %>% ggsave(filename = "map1.png", height = 4, width = 8)
+map1 <- image_read("map1.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-07", map = sq_map) %>% ggsave(filename = "map2.png", height = 4, width = 8)
+map2 <- image_read("map2.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-08", map = sq_map) %>% ggsave(filename = "map3.png", height = 4, width = 8)
+map3 <- image_read("map3.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-09", map = sq_map) %>% ggsave(filename = "map4.png", height = 4, width = 8)
+map4 <- image_read("map4.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-10", map = sq_map) %>% ggsave(filename = "map5.png", height = 4, width = 8)
+map5 <- image_read("map5.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-11", map = sq_map) %>% ggsave(filename = "map6.png", height = 4, width = 8)
+map6 <- image_read("map6.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-12", map = sq_map) %>% ggsave(filename = "map7.png", height = 4, width = 8)
+map7 <- image_read("map7.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-13", map = sq_map) %>% ggsave(filename = "map8.png", height = 4, width = 8)
+map8 <- image_read("map8.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-14", map = sq_map) %>% ggsave(filename = "map9.png", height = 4, width = 8)
+map9 <- image_read("map9.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-15", map = sq_map) %>% ggsave(filename = "map10.png", height = 4, width = 8)
+map10 <- image_read("map10.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-16", map = sq_map) %>% ggsave(filename = "map11.png", height = 4, width = 8)
+map11 <- image_read("map11.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-17", map = sq_map) %>% ggsave(filename = "map12.png", height = 4, width = 8)
+map12 <- image_read("map12.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-18", map = sq_map) %>% ggsave(filename = "map13.png", height = 4, width = 8)
+map13 <- image_read("map13.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-19", map = sq_map) %>% ggsave(filename = "map14.png", height = 4, width = 8)
+map14 <- image_read("map14.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-20", map = sq_map) %>% ggsave(filename = "map15.png", height = 4, width = 8)
+map15 <- image_read("map15.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-21", map = sq_map) %>% ggsave(filename = "map16.png", height = 4, width = 8)
+map16 <- image_read("map16.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-22", map = sq_map) %>% ggsave(filename = "map17.png", height = 4, width = 8)
+map17 <- image_read("map17.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-23", map = sq_map) %>% ggsave(filename = "map18.png", height = 4, width = 8)
+map18 <- image_read("map18.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-24", map = sq_map) %>% ggsave(filename = "map19.png", height = 4, width = 8)
+map19 <- image_read("map19.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-25", map = sq_map) %>% ggsave(filename = "map20.png", height = 4, width = 8)
+map20 <- image_read("map20.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-26", map = sq_map) %>% ggsave(filename = "map21.png", height = 4, width = 8)
+map21 <- image_read("map21.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-27", map = sq_map) %>% ggsave(filename = "map22.png", height = 4, width = 8)
+map22 <- image_read("map22.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-28", map = sq_map) %>% ggsave(filename = "map23.png", height = 4, width = 8)
+map23 <- image_read("map23.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-29", map = sq_map) %>% ggsave(filename = "map24.png", height = 4, width = 8)
+map24 <- image_read("map24.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-30", map = sq_map) %>% ggsave(filename = "map25.png", height = 4, width = 8)
+map25 <- image_read("map25.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-01", map = sq_map) %>% ggsave(filename = "map26.png", height = 4, width = 8)
+map26 <- image_read("map26.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-02", map = sq_map) %>% ggsave(filename = "map27.png", height = 4, width = 8)
+map27 <- image_read("map27.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-03", map = sq_map) %>% ggsave(filename = "map28.png", height = 4, width = 8)
+map28 <- image_read("map28.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-04", map = sq_map) %>% ggsave(filename = "map29.png", height = 4, width = 8)
+map29 <- image_read("map29.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-05", map = sq_map) %>% ggsave(filename = "map30.png", height = 4, width = 8)
+map30 <- image_read("map30.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-06", map = sq_map) %>% ggsave(filename = "map31.png", height = 4, width = 8)
+map31 <- image_read("map31.png")
+
+img <- c(map1, map2, map3, map4, map5, map6, map7, map8, map9, map10, map11, map12, map13, map14, map15, map16, map17, map18, map19, map20, map21, map22, map23, map24, map25, map26, map27, map28, map29, map30, map21)
+Joseph20190406to0506 <- image_animate(image_scale(img, "1200x1200"), fps = , dispose = "previous")
+image_write_video(Joseph20190406to0506, "Joseph20190406to0506.mp4", framerate = 1, color = "none")
+
+
+```
+
+What if we look at a many-feeds bird over several days? Let's try Joseph
+```{r}
+gamboamap(bird = "Joseph", dayfeed = "2019-04-06", map = sq_map) %>% ggsave(filename = "map1.png", height = 4, width = 8)
+map1 <- image_read("map1.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-07", map = sq_map) %>% ggsave(filename = "map2.png", height = 4, width = 8)
+map2 <- image_read("map2.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-08", map = sq_map) %>% ggsave(filename = "map3.png", height = 4, width = 8)
+map3 <- image_read("map3.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-09", map = sq_map) %>% ggsave(filename = "map4.png", height = 4, width = 8)
+map4 <- image_read("map4.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-10", map = sq_map) %>% ggsave(filename = "map5.png", height = 4, width = 8)
+map5 <- image_read("map5.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-11", map = sq_map) %>% ggsave(filename = "map6.png", height = 4, width = 8)
+map6 <- image_read("map6.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-12", map = sq_map) %>% ggsave(filename = "map7.png", height = 4, width = 8)
+map7 <- image_read("map7.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-13", map = sq_map) %>% ggsave(filename = "map8.png", height = 4, width = 8)
+map8 <- image_read("map8.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-14", map = sq_map) %>% ggsave(filename = "map9.png", height = 4, width = 8)
+map9 <- image_read("map9.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-15", map = sq_map) %>% ggsave(filename = "map10.png", height = 4, width = 8)
+map10 <- image_read("map10.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-16", map = sq_map) %>% ggsave(filename = "map11.png", height = 4, width = 8)
+map11 <- image_read("map11.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-17", map = sq_map) %>% ggsave(filename = "map12.png", height = 4, width = 8)
+map12 <- image_read("map12.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-18", map = sq_map) %>% ggsave(filename = "map13.png", height = 4, width = 8)
+map13 <- image_read("map13.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-19", map = sq_map) %>% ggsave(filename = "map14.png", height = 4, width = 8)
+map14 <- image_read("map14.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-20", map = sq_map) %>% ggsave(filename = "map15.png", height = 4, width = 8)
+map15 <- image_read("map15.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-21", map = sq_map) %>% ggsave(filename = "map16.png", height = 4, width = 8)
+map16 <- image_read("map16.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-22", map = sq_map) %>% ggsave(filename = "map17.png", height = 4, width = 8)
+map17 <- image_read("map17.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-23", map = sq_map) %>% ggsave(filename = "map18.png", height = 4, width = 8)
+map18 <- image_read("map18.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-24", map = sq_map) %>% ggsave(filename = "map19.png", height = 4, width = 8)
+map19 <- image_read("map19.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-25", map = sq_map) %>% ggsave(filename = "map20.png", height = 4, width = 8)
+map20 <- image_read("map20.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-26", map = sq_map) %>% ggsave(filename = "map21.png", height = 4, width = 8)
+map21 <- image_read("map21.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-27", map = sq_map) %>% ggsave(filename = "map22.png", height = 4, width = 8)
+map22 <- image_read("map22.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-28", map = sq_map) %>% ggsave(filename = "map23.png", height = 4, width = 8)
+map23 <- image_read("map23.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-29", map = sq_map) %>% ggsave(filename = "map24.png", height = 4, width = 8)
+map24 <- image_read("map24.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-04-30", map = sq_map) %>% ggsave(filename = "map25.png", height = 4, width = 8)
+map25 <- image_read("map25.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-01", map = sq_map) %>% ggsave(filename = "map26.png", height = 4, width = 8)
+map26 <- image_read("map26.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-02", map = sq_map) %>% ggsave(filename = "map27.png", height = 4, width = 8)
+map27 <- image_read("map27.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-03", map = sq_map) %>% ggsave(filename = "map28.png", height = 4, width = 8)
+map28 <- image_read("map28.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-04", map = sq_map) %>% ggsave(filename = "map29.png", height = 4, width = 8)
+map29 <- image_read("map29.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-05", map = sq_map) %>% ggsave(filename = "map30.png", height = 4, width = 8)
+map30 <- image_read("map30.png")
+gamboamap(bird = "Joseph", dayfeed = "2019-05-06", map = sq_map) %>% ggsave(filename = "map31.png", height = 4, width = 8)
+map31 <- image_read("map31.png")
+
+img <- c(map1, map2, map3, map4, map5, map6, map7, map8, map9, map10, map11, map12, map13, map14, map15, map16, map17, map18, map19, map20, map21, map22, map23, map24, map25, map26, map27, map28, map29, map30, map21)
+Joseph20190406to0506 <- image_animate(image_scale(img, "1200x1200"), fps = , dispose = "previous")
+image_write_video(Joseph20190406to0506, "Joseph20190406to0506.mp4", framerate = 1, color = "none")
+
+
+```
+
+## Other map visuals
+
+What does one day look like at a feeder with a "territorial" bird
+```{r}
+Day_20190404 <- nonmix %>%
+  filter(day == "2019-04-04") %>%
+  arrange(starttime) %>%
+  filter(station == "JF30")
+```
+
+Can we see what it looks like during one day with all the many-feed birds?
+```{r}
+#2019-04-06 looks like it has a few birds that go to max 2 feeds but had more than 50 feeds
+daily %>% 
+  filter(numstation < 3) %>%
+  filter(dayfeeds > 50) %>%
+  filter(day =="2019-04-06") %>%
+ggplot(aes(dayfeeds, numstation, col = name)) + 
+  geom_jitter() +
+  theme(legend.position = "none")
+
+#Which birds are they
+daily %>% 
+  filter(day == "2019-04-06") %>%
+  filter(numstation < 3) %>%
+  filter(dayfeeds > 50) %>%
+  group_by(name) %>%
+  summarize(count = n())
+
+# "Arizbel", "Dalia", "Diana", "Fernando", "Leslye" are the many-feeds birds on 2019-04-06
+
+Arizbel <- nonmix %>%
+  filter(name == "Arizbel", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Arizbelfeeds <- Arizbel %>% group_by(station) %>% summarize(count = n()) %>% inner_join(latlong)
+
+
+Dalia <- nonmix %>%
+  filter(name == "Dalia", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Daliafeeds <- Dalia %>% group_by(station) %>% summarize(count = n()) %>% inner_join(latlong)
+
+Diana <- nonmix %>%
+  filter(name == "Diana", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Dianafeeds <- Diana %>% group_by(station) %>% summarize(count = n()) %>% inner_join(latlong)
+
+Fernando <- nonmix %>%
+  filter(name == "Fernando", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Fernandofeeds <- Fernando %>% group_by(station) %>% summarize(count = n()) %>% inner_join(latlong)
+
+Leslye <- nonmix %>%
+  filter(name == "Leslye", day == "2019-04-06") %>%
+  arrange(starttime) %>%
+  select(starttime, station, name) %>%
+  mutate(nextfeed = lead(station)) %>%
+  mutate(switch = if_else(station == nextfeed, F, T)) %>%
+  inner_join(latlong)
+
+Leslyefeeds <- Leslye %>% group_by(station) %>% summarize(count = n()) %>% inner_join(latlong)
+
+
+ggmap(sq_map) + 
+    #Arizbel
+    geom_point(aes(x = long, y = lat), data = latlong,  
+             alpha = .5, color="darkred", size = 1) +
+    geom_point(aes(x = long, y = lat, size = 3), data = Arizbel,
+             alpha = .5, color = "black") +
+    geom_path(data = Arizbel, aes(x = long, y = lat, color = starttime), 
+            size = 1, lineend = "round") +
+    geom_text(aes(x = long, y = lat, label = count), 
+              position = position_nudge(y = -0.0003), data = Arizbelfeeds) +
+    #Dalia 
+    geom_point(aes(x = long, y = lat, size = 3), data = Dalia,
+             alpha = .5, color = "green") +
+    geom_path(data = Dalia, aes(x = long, y = lat, color = starttime), 
+            size = 1, lineend = "round") +
+    geom_text(aes(x = long, y = lat, label = count), 
+              position = position_nudge(y = -0.0003), data = Daliafeeds) +
+    #Diana
+    geom_point(aes(x = long, y = lat, size = 3), data = Diana,
+             alpha = .5, color = "blue") +
+    geom_path(data = Diana, aes(x = long, y = lat, color = starttime), 
+            size = 1, lineend = "round") +
+    geom_text(aes(x = long, y = lat, label = count), 
+              position = position_nudge(y = -0.0003), data = Dianafeeds) +
+    #Fernando
+    geom_point(aes(x = long, y = lat, size = 3), data = Fernando,
+             alpha = .5, color = "yellow") +
+    geom_path(data = Fernando, aes(x = long, y = lat, color = starttime), 
+            size = 1, lineend = "round") +
+    geom_text(aes(x = long, y = lat, label = count), 
+              position = position_nudge(y = -0.0003), data = Fernandofeeds) +
+    #Leslye
+    geom_point(aes(x = long, y = lat, size = 3), data = Leslye,
+             alpha = .5, color = "orange") +
+    geom_path(data = Leslye, aes(x = long, y = lat, color = starttime), 
+            size = 1, lineend = "round") +
+    geom_text(aes(x = long, y = lat, label = count), 
+              position = position_nudge(y = -0.0003), data = Leslyefeeds) +
+    labs(x = " ", y = " ", title = str_c("2019-04-06, max 2 stations, and min 50 feeds")) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+## Verifying the use of edge feeders
+
+```{r}
+edgestations <- c("JF05", "JF06", "JF13", "JF01", "JF04", "JF19", "JF24", "JF20", "JF18", "JF09")
+
+quick <- nonmix %>%
+  #First make a list of every station and day with the number of feeds at that station
+  group_by(station, day) %>%
+  summarize(feeds = n()) %>%
+  ungroup() %>%
+  #Use the complete function to fill in station and date combinations that are not present with 0s. Most of these are just going to be days in which the station was not available. 
+  complete(day, station, fill = list(feeds = 0)) %>%
+  mutate(combined = str_c(station, day)) %>%
+  #Join with the dataframe from the previous chunk with all the dates in which each station was present
+  left_join(fullstationdate_ready, by = "combined") %>%
+  #Filter out any of the station's dates in which it was not available
+  filter(deployed == TRUE) %>%
+  #Now summarize the number of feeds per day per station at high and low quality feeders
+  group_by(station) %>%
+  summarize(feeds = sum(feeds), days = n()) %>%
+  mutate(feedsperday = feeds/days) %>%
+  select(-feeds, - days) %>%
+  ungroup() %>%
+  mutate(edge = station %in% edgestations)
+
+quickedge <- quick %>% filter(edge == TRUE)
+quicknon <- quick %>% filter(edge == FALSE)
+
+wilcox.test(quickedge$feedsperday, quicknon$feedsperday, paired = FALSE)
+# Wilcoxon rank sum exact test
+# 
+# data:  quickedge$feedsperday and quicknon$feedsperday
+# W = 59, p-value = 0.1458
+# alternative hypothesis: true location shift is not equal to 0
+
+
+mean(quickedge$feedsperday)
+#[1] 11.86132
+mean(quicknon$feedsperday)
+#[1] 17.07436
+```
+
+```{r}
+birdday <- nonmix %>%
+  distinct(name, day) %>%
+  arrange(name, day) %>%
+  rename(bird = name,
+         dayfeed = day)
+
+maps <- mapply(birdday$name, FUN = gamboapoints, dayfeed = birdday$day)  
+
+gamboapoints(birdday$name[1], birdday$day[1])
+
+maps
+
+airquality
+
+plotserieslines <- function(yvar){
+    ggplot(airquality, aes_(x=~Day,y=as.name(yvar))) +
+        geom_line() +
+        facet_wrap(~Month)
+}
+
+plotserieslines()
+  
+
+lapply(names(birdday[c(1:2)]), gamboapoints)
+```
+
+```{r}
+
+#prep the data
+datamap <- nonmix %>%
+  select(name, day, station, starttime, gensex) %>%
+  mutate(daytime = hms::as_hms(format(starttime, format = "%H:%M:%S"))) %>%
+  arrange(name, day, daytime) %>%
+  mutate(periodlength = lubridate::hms(daytime)) %>%
+  mutate(seconds = period_to_seconds(periodlength)) %>%
+  inner_join(latlong) %>%
+  mutate(long = jitter(long, amount = .0001), lat = jitter(lat, amount = 0.0001)) %>%
+  #filter(day < "2019-04-15", day > "2019-04-10")
+  filter(name == "Thomas")
+
+  #full_join(crossing(name=unique(nonmix$name), day=unique(nonmix$day))) %>%
+  # mutate(empty=ifelse(is.na(station), "No data available", NA_character_),
+  #        x=mean(range(name, na.rm=TRUE)), 
+  #        y=mean(range(day, na.rm=TRUE)))
+
+  
+#get the number of feeds per station
+feedpoints <- datamap %>% 
+  group_by(name, day, station) %>% 
+  summarize(countstation = n(), gensex = gensex) %>% 
+  inner_join(latlong)
+
+  
+#map it
+mapit <- ggplot() + 
+  geom_point(aes(x = long, y = lat), data = allplaces, color="black", size = 1) +
+  geom_point(aes(x = long, y = lat, size = 1, col = seconds), data = datamap, alpha = .5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_path(data = datamap, aes(x = long, y = lat, col = seconds), size = 1, lineend = "round") +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_text(aes(x = long, y = lat, label = countstation), 
+            position = position_nudge(y = -0.0003), data = feedpoints) +
+  labs(x = " ", y = " ") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+allmap <- mapit + facet_wrap(name ~ day)
+    # theme(strip.text.x = element_text(size = 12),
+    #       strip.text.y = element_text(size = 12))
+    # 
+
+ggsave("allplot7.pdf", plot = allmap, width = 2000, height = 1000, limitsize = FALSE)
+
+ggsave("allplot8.pdf", plot = allmap, width = 2000, height = 1000, limitsize = FALSE)
+
+ggsave("allplot9.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+
+ggsave("allplot10.pdf", plot = allmap, width = 2000, height = 1000, limitsize = FALSE )
+
+ggsave("David.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+
+ggsave("Dalia.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Arizbel2.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Bertha2.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Fernando.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Mayleen.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Flor.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Micah.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+ggsave("Thomas.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+
+
+
+datamap %>% filter(name == "Katherine") %>% select(name, station, starttime)
+
+mpg
+
+?vars
+
+ggplot(mpg, aes(displ, cty)) + 
+  geom_point() +
+  facet_grid(vars(drv), vars(cyl)) + geom_text(x = 5, y = 20, label = "Blah")
+```
+
+Types
+```{r}
+#prep the data
+datamap <- nonmix %>%
+  select(name, day, station, starttime, gensex) %>%
+  mutate(daytime = hms::as_hms(format(starttime, format = "%H:%M:%S"))) %>%
+  arrange(name, day, daytime) %>%
+  mutate(periodlength = lubridate::hms(daytime)) %>%
+  mutate(seconds = period_to_seconds(periodlength)) %>%
+  inner_join(latlong) %>%
+  mutate(long = jitter(long, amount = .0001), lat = jitter(lat, amount = 0.0001)) %>%
+  filter(day >= "2019-04-19", day <= "2019-04-24") %>%
+  filter(name == "Arizbel")
+
+#get the number of feeds per station
+feedpoints <- datamap %>% 
+  group_by(name, day, station) %>% 
+  summarize(countstation = n(), gensex = gensex) %>% 
+  inner_join(latlong)
+
+allplaces2 <- allplaces %>% 
+  filter(day >= "2019-04-19", day <= "2019-04-24")
+
+mapit <- ggplot() + 
+  geom_point(aes(x = long, y = lat), data = allplaces2, color="black", size = 1) +
+  geom_point(aes(x = long, y = lat, size = 1, col = seconds), data = datamap, alpha = .5) +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_path(data = datamap, aes(x = long, y = lat, col = seconds), size = 1, lineend = "round") +
+  scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_text(aes(x = long, y = lat, label = countstation), 
+            position = position_nudge(y = -0.0003), data = feedpoints) +
+  labs(x = " ", y = " ") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+allmap <- mapit + facet_wrap(~ day)
+
+ggsave("Chambrae.pdf", plot = allmap, width = 50, height = 30, limitsize = FALSE)
+
+```
+
+```{r}
+datamap <- durready %>%
+  select(name, day, station, starttime, gensex) %>%
+  mutate(daytime = hms::as_hms(format(starttime, format = "%H:%M:%S"))) %>%
+  arrange(name, day, daytime) %>%
+  mutate(periodlength = lubridate::hms(daytime)) %>%
+  mutate(seconds = period_to_seconds(periodlength)) %>%
+  inner_join(latlong) %>%
+  #mutate(long = jitter(long, amount = .0002), lat = jitter(lat, amount = 0.0002)) %>%
+  filter(day == "2019-04-15",
+         station == "JF30")
+
+#map it
+mapit <- 
+  ggmap(sq_map) + 
+  geom_point(aes(x = long, y = lat), data = allplaces, color="black", size = 1) +
+  geom_point(aes(x = long, y = lat, size = 1, col = name), data = datamap, alpha = .5) +
+  #scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  geom_path(data = datamap, aes(x = long, y = lat, col = name), size = 1, lineend = "round") +
+  #scale_color_gradient2(low="blue", mid="green", high="red", midpoint = 45000, limits = c(20700, 69300)) +
+  #geom_text(aes(x = long, y = lat, label = countstation), 
+            #position = position_nudge(y = -0.0003), data = feedpoints) +
+  labs(x = " ", y = " ") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+allmap <- mapit + facet_wrap(~day)
+
+ggplot(data = datamap, aes(x=daytime, y=0)) +
+  geom_point(size = 2, aes(col = name))  +
+  theme(panel.background = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())
+
+library(ggmap)
+```
+
+```{r}
+stations <- read_csv("readerschedule2.csv")
+
+dates_a <- as_tibble(rep(seq(as.Date("2018-01-20"),as.Date("2018-02-02"),1),each=6)) %>% rename(day = value)
+points_a <- stations %>%
+  filter(period == "a") %>%
+  select(station)
+a <- cbind(dates_a, points_a)
+
+dates_b <- as_tibble(rep(seq(as.Date("2018-02-03"),as.Date("2018-03-08"),1),each=20)) %>% rename(day = value)
+points_b <- stations %>%
+  filter(period == "b") %>%
+  select(station)
+b <- cbind(dates_b, points_b)
+
+dates_c <- as_tibble(rep(seq(as.Date("2018-03-09"),as.Date("2018-05-11"),1),each=28)) %>% rename(day = value)
+points_c <- stations %>%
+  filter(period == "c") %>%
+  select(station)
+c <- cbind(dates_c, points_c)
+
+dates_d <- as_tibble(rep(seq(as.Date("2018-05-12"),as.Date("2018-06-01"),1),each=20)) %>% rename(day = value)
+points_d <- stations %>%
+  filter(period == "d") %>%
+  select(station)
+d <- cbind(dates_d, points_d)
+
+dates_e <- as_tibble(rep(seq(as.Date("2018-10-08"),as.Date("2019-02-17"),1),each=10)) %>% rename(day = value)
+points_e <- stations %>%
+  filter(period == "e") %>%
+  select(station)
+e <- cbind(dates_e, points_e)
+
+dates_f <- as_tibble(rep(seq(as.Date("2019-02-18"),as.Date("2019-05-31"),1),each=20)) %>% rename(day = value)
+points_f <- stations %>%
+  filter(period == "f") %>%
+  select(station)
+f <- cbind(dates_f, points_f)
+
+
+
+allplaces <- rbind(a,b,c,d,e,f) %>%
+  inner_join(latlong) %>%
+  arrange(day)
+```
+
