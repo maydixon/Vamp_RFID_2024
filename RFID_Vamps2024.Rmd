@@ -12,21 +12,54 @@ library(lubridate)
 library(hms)
 library(readxl)
 library(chron)
+library(Hmisc)
 ```
 
+# https://dshizuka.github.io/networkanalysis/networktypes_socialnetworks.html
 
 # import data
 # goal: pull all files in RFID Data folder into one dataframe 
 ```{r}
-#main data 
-RFID_Data <- read_excel("RFID-2024-06-10_bayano_tole_chorrera.xlsx")
-View(RFID_Data)
+
 # import bat ID/ name data 
 v2022_bats <- read_excel("/Users/maydixon/GitHub/Vamp_2023/2022_vampire_data.xlsx", sheet = "bats")
 head(v2022_bats)
+
+#main data 
+#RFID_Data <- read_excel("RFID-2024-06-10_bayano_tole_chorrera.xlsx")
+#View(RFID_Data)
+
+# import  data- take all the files in a folder and pull them into the same dataframe
+
+RFID_Data_full <- list.files(path = "Raw Data/",  # Identify all excl files with RFID in the name
+                       pattern = "RFID", full.names = TRUE) %>% #
+  lapply(read_excel) %>%  # Store all files in list
+  bind_rows     # Combine data sets into one data set 
+
+head(RFID_Data_full)
+write.csv(RFID_Data_full, "RFID_Data.CSV")
+
+str(RFID_Data_full)
+
+RFID_Data <- RFID_Data_full
+#View bit of  code to see if okay
+# set.seed(1)
+# test_data <- slice_sample(RFID_Data_full, n = 10000) # to run with a smaller set
+# RFID_Data <- test_data
 ```
 
-# RFID data formatting 
+# RFID data shaping 
+```{r}
+#filter out duplicate rows
+nrow(RFID_Data)
+
+RFID_Data <-RFID_Data %>%
+  distinct(.keep_all = TRUE)
+
+nrow(RFID_Data)
+```
+
+
 ```{r}
 #remove spaces from column names
 colnames(RFID_Data) <- gsub(" ", "_", colnames(RFID_Data))
@@ -97,8 +130,8 @@ RFID_Data <-
             ) %>%
       mutate(Locations = recode(
            Locations, #change  door names 
-          "B11" = "CBDoor", 
-          "B12" = "BCDoor",
+          "B11" = "CTDoor", 
+          "B12" = "TCDoor",
           "B13" = "BTDoor",
           "B14" = "TBDoor")) %>%
           
@@ -124,11 +157,11 @@ RFID_Data <-
           c("B07", "B09") ~ "Small", 
           c("B08", "B10") ~ "Flat", 
           c("C14", "C15", "C16","T14", "T15", "T16","B14", "B15", "B16") ~ "Feeder", 
-          c("CBDoor","BCDoor","BTDoor", "TBDoor") ~ "Door"
+          c("B11","B12","B13", "B14") ~ "Door"
           )
       ) %>%
       mutate(Coords = case_match(
-           Locations, # add coordinates, start with "X,Y", and then split into two columns with "," as seperateor 
+           Locations, # add coordinates, start with "X,Y", and then split into two columns with "," as separator 
           "C01" ~ "20,200", 
           "C02" ~ "155,200",
           "C03" ~ "20,125", 
@@ -176,22 +209,28 @@ RFID_Data <-
             Coords,
             delim = ",", 
             names = c("Coord_X", "Coord_Y")
-                            ) %>%
+            ) %>%
       mutate_at(vars(Coord_X, Coord_Y), as.numeric)
 
 
+#hmisc describe function to explore values       
+describe(RFID_Data) 
 
-
-set.seed(1)
-slice_sample(RFID_Data, n = 10)
-
-
+# explore unique values - looking for any NAs
+lapply(RFID_Data[,15:20], unique )
+# all good
 
 
 ```
 
 # script for adding vamp names to dataset
 ```{r}
+
+#remove period from decimal bat name to make it match vamp name list
+RFID_Data$DEC_Tag_ID <- RFID_Data$DEC_Tag_ID %>%
+      str_remove( "[.]") 
+
+
 #table with just the various bat names (also adding OG group)
 v2022_names <- v2022_bats %>% select(bat_name, formal_ID, new_formal_ID, RFID_number, group_ID )
 
@@ -207,8 +246,9 @@ nameslong <- v2022_names %>%
   gather(ID_type, IDS, c(bat_name, formal_ID, new_formal_ID, RFID_number), na.rm = TRUE) %>%
   arrange(bat_name_full) %>%
   select( - ID_type, -group_ID)      #delete extra columns
-      
-nameslong
+
+# add test tag to dataset (remove later)      
+nameslong <- nameslong %>%rbind(c("test_NA", 989001040984122))
 
 #join to database by ID, separate name and group of origin
 RFID_Data <- RFID_Data %>%
@@ -216,17 +256,100 @@ RFID_Data <- RFID_Data %>%
       separate_wider_delim(bat_name_full, delim = "_", names = c("Bat_ID", "Bat_Group"))
  
 
-   
-head(RFID_Data)
-    
+#############
+#troubleshoot, which names aren't coming through? 
+#pull all names that are coming through
+ RFID_Data %>%
+       group_by(Bat_ID)%>%
+      arrange(Bat_ID) %>%
+      slice_head(n = 1) %>%
+       select(Bat_ID) 
 
+v2022_names %>%arrange(bat_name)
+#no kamari: 9890010404606665
+
+ RFID_Data %>%
+       filter(is.na(Bat_ID)) %>% nrow()
+ 
+ RFID_Data %>%
+       filter(is.na(Bat_ID)) %>%
+       group_by(DEC_Tag_ID) %>%
+       slice_head(n = 1) 
+
+ #get rid of strange values (interference? To only have known bats (get rid of test tags as well))
+ 
+RFID_Data <-  RFID_Data %>%
+       filter(!is.na(Bat_ID))
+
+###########################
+head(RFID_Data)
+
+ #writecombined data   
+write.csv(RFID_Data, "Combined_Data/RFID_Data.CSV", row.names = F) 
+#
+test_data <- slice_sample(RFID_Data, n = 10000) # to run with a smaller set
+test_data2 <- head(RFID_Data, 10000) #data with continuous runs
+```
+
+# Try to convert data into durations
+# Adapted from Jay Falk code "Collapse Duration"
+This function uses data made from the readin.RFID function and collapses it so that it shows the number of seconds present at a feeder and at what time. It also takes into account when a bird leaves the feeder for a short amount of time and comes back, and will collapse these together. The secaway variable is the amount of time away from the feeder that the function will allow the bird to leave the feeder before it considers it a new feed
+```{r}
+test_data2 %>%
+      arrange(Locations, Scan_DateTime)
+```
+
+```{r duration-function}
+
+#Could start here, with loaded RFID data 
+
+duration.RFID <- function(datafile, secaway){ #This function uses a data made from readin.RFID function and collapses it so that it shows the number of seconds present at an antenna and at what time
+  datafile <- datafile %>% arrange(Locations, Scan_DateTime) #possibly should use another feeder
+  collapsed <- tibble() #creates a new tibble to be returned 
+  templine <- tibble(rawtext = "x", RFID = "x", id = "x", stringtime = "1999-01-01 00:00:00", time = "1999-01-01 00:00:00", station = "x") #creates a temporary junk line to the end so that the conditional statements work for the last line of data
+  datafile <- rbind(datafile, templine) #adds the junk line to the end of the data file
+  count <- dseconds(1) #count holds the number of seconds present at the feeder, including any gaps less than or equal to secaway
+  feedsecs <- 1 #feedsecs holds the number of seconds actually feeding, NOT incuding the secaway gaps
+  secs <- as.duration(secaway)
+  for(i in 1:(nrow(datafile)-1)) {
+    if(((datafile$time[i+1] - datafile$time[i]) <= secs) && 
+       (datafile$id[i+1] == datafile$id[i]) &&
+       (datafile$station[i+1] == datafile$station[i])){#checks if the time in line i is only one second lower than the line after i, and if it's the same bird
+      count <- count + as.duration(datafile$time[i+1] - datafile$time[i]) #if the above statement is true, this continues to grow until there is a break in the continuity of the feed
+      feedsecs <- feedsecs + 1
+    }
+    else {#if the seconds are not continuous, this creates a new line to be added to the "collapsed" tibble with all the necessary info
+      templine <- tibble(
+        id = datafile$id[i],
+        starttime = datafile$time[i] - dseconds(count-1),
+        station = datafile$station[i],
+        duration = count,
+        feeding = as.duration(feedsecs)
+      )
+      collapsed <- rbind(collapsed, templine) #combines the newest line of collapsed data to the other lines
+      count <- 1 #returns the duration count to 1 to start over at the top of the for loop
+      feedsecs <- 1 #returns the time feeding to 1 to start over at the top of the for loop
+    }
+  }
+  return(collapsed)
+}
+```
+```{r}
 
 ```
+
+
+
+
+
+
+
+
 
 # Explore antenna locations
 ```{r}
 RFID_Data %>%
-      ggplot(aes(x= Coord_X, y=Coord_Y, color = HEX_Tag_ID)) +
+      ggplot(aes(x= Coord_X, y=Coord_Y, color = Antenna_Type)) +
       geom_jitter(alpha = 0.5) +
       scale_y_reverse() + #limits = c(228,0)
       theme_dark()+
